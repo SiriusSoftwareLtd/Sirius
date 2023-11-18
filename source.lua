@@ -1,49 +1,50 @@
 --[[
 
-Sirius | Restrictive License
+Sirius
 
-© 2023 Sirius Software Ltd. All Rights Reserved. 
-No part of this code may be reproduced, distributed, or transmitted in any form or by any means, without the prior written permission of the author/creator.
+© 2023 Sirius Software Ltd. 
+All Rights Reserved.
 
 --]]
 
 
 --[[
 
-Todo
+Sirius Pre-Hyperion Todo List
+
+High Priority
  - Invisible, Godmode
- - Do all Scripts buttons and Universal scripts
+ - All Scripts buttons and Universal scripts
  - Chat Spam Detection
  - Custom Script Prompts
- - Playerlist Kill, Spectate and ESP
- - http.request support
- - Improve perf with that console thing
+ - Player Kill, Spectate and ESP via Playerlist
+ - http.request support for Sirius Intelligent HTTP Interception
+ - Performance Improvements to Roblox itself
  
-Todo at a later date
- - Spectate Anim like GTA serverhop, tween to high in sky, then tween to other player's head
- - Chat Spy - (tracks who they're whispering to based on original message)
+Moderate Priority
+ - Spectate Animation, like GTA serverhop, tween to high in the sky, then tween to other player's head
+ - Chat Spy Tracking: Follows who they're whispering to based on original message
  - Starlight 
  - Chatlogs
- - GTA Serverhop (polish)
- - Anti-Spam (chat) formula, based on text length, caps
- - Ensure Sirius is difficult to detect
- - Lower Graphics on low fps
+ - GTA Serverhop
+ - Anti-Spam (chat) formula, based on text length, caps, emojis etc.
+ - Reduce any form of detection of Sirius
+ - Automated lowering of graphics on lower FPS, ensure no false positives
  
-Settings to add (that don't exist in prev Sirius)
+Potential Future Setting Options
  - Block entire domain or just the specific page in the Sirius Intelligent Flow Interception. Do this on case by case, e.g blocked = {"link.com", true} - true being whether its the domain or not
  - Serverhop type (default/gta)
- - Lower Graphics on low FPS
- - Hook Specific Functions e.g idk ok
+ - Hook Specific Functions to reduce the need for external scripts
  
 --]]
 
+-- Ensure the game is loaded 
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
 
 -- Check License Tier
-local Pro = LRM_UserNote and string.find(string.lower(LRM_UserNote), "pro") or false
-local Essential = LRM_UserNote and string.find(string.lower(LRM_UserNote), "essential") or false
+local Pro = true -- We're open sourced now!
 
 -- Create Variables for Roblox Services
 local coreGui = game:GetService("CoreGui")
