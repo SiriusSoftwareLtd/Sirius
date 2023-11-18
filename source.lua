@@ -1,5 +1,3 @@
-LPH_NO_VIRTUALIZE = function(f) return f end
-
 --[[
 
 Sirius | Restrictive License
@@ -4281,7 +4279,7 @@ players.PlayerRemoving:Connect(function(player)
 	end
 end)
 
-runService.RenderStepped:Connect(LPH_NO_VIRTUALIZE (function(frame)
+runService.RenderStepped:Connect(function(frame)
 	if not checkSirius() then return end
 	local fps = math.round(1/frame)
 
@@ -4292,9 +4290,9 @@ runService.RenderStepped:Connect(LPH_NO_VIRTUALIZE (function(frame)
 		siriusValues.frameProfile.totalFPS -= siriusValues.frameProfile.fpsQueue[1]
 		table.remove(siriusValues.frameProfile.fpsQueue, 1)
 	end
-end))
+end)
 
-runService.Stepped:Connect(LPH_NO_VIRTUALIZE (function()
+runService.Stepped:Connect(function()
 	if not checkSirius() then return end
 
 	local character = localPlayer.Character
@@ -4318,9 +4316,9 @@ runService.Stepped:Connect(LPH_NO_VIRTUALIZE (function()
 			end
 		end
 	end
-end))
+end)
 
-runService.Heartbeat:Connect(LPH_NO_VIRTUALIZE (function()
+runService.Heartbeat:Connect(function()
 	if not checkSirius() then return end
 
 	local character = localPlayer.Character
@@ -4385,9 +4383,9 @@ runService.Heartbeat:Connect(LPH_NO_VIRTUALIZE (function()
 			bodyGyro.Parent = nil
 		end
 	end
-end))
+end)
 
-runService.Heartbeat:Connect(LPH_NO_VIRTUALIZE (function(frame)
+runService.Heartbeat:Connect(function(frame)
 	if not checkSirius() then return end
 	if Pro then
 		if checkSetting("Spatial Shield").current and tonumber(checkSetting("Spatial Shield Threshold").current) then
@@ -4429,7 +4427,7 @@ runService.Heartbeat:Connect(LPH_NO_VIRTUALIZE (function(frame)
 	else
 		undoAnonymousChanges()
 	end
-end))
+end)
 
 for _, instance in next, game:GetDescendants() do
 	if instance:IsA("Sound") then
