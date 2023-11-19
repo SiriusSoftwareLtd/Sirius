@@ -97,6 +97,7 @@ local siriusValues = {
 	interfaceAsset = 14183548964,
 	cdn = "https://cdn.sirius.menu/SIRIUS-SCRIPT-CORE-ASSETS/",
 	icons = "https://cdn.sirius.menu/SIRIUS-SCRIPT-CORE-ASSETS/Icons/",
+	enableExperienceSync = false, -- Games are no longer available due to a lack of whitelisting, they may be made open source at a later date, however they are patched as of now and are useless to the end user. Turning this on may introduce "fake functionality".
 	games = {
 		BreakingPoint = {
 			name = "Breaking Point",
@@ -3816,8 +3817,9 @@ local function start()
 		queueNotification("License Error", "We've detected a key being placed above Sirius loadstring, however your key seems to be invalid. Make a support request at sirius.menu/discord to get this solved within minutes.", "document-minus")
 	end
 
-
-	task.spawn(syncExperienceInformation)
+	if siriusValues.enableExperienceSync then
+		task.spawn(syncExperienceInformation) 
+	end
 end
 
 -- Sirius Events
