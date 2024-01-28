@@ -2,7 +2,7 @@
 
 Sirius
 
-© 2023 Sirius Software Ltd. 
+© 2024 Sirius 
 All Rights Reserved.
 
 --]]
