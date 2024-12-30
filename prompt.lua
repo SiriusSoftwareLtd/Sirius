@@ -10,6 +10,8 @@ if runService:IsStudio() then
 	useStudio = true
 end
 
+local debounce = false
+
 local function open(prompt)
 	prompt.Policy.Size = UDim2.new(0, 450, 0, 120)
 
@@ -46,6 +48,7 @@ local function open(prompt)
 end
 
 local function close(prompt)
+	debounce = true
 	tweenService:Create(prompt.Policy, TweenInfo.new(0.3, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = UDim2.new(0, 430, 0, 110)}):Play()
 
 	tweenService:Create(prompt.Policy.Title, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 1}):Play()
@@ -117,22 +120,26 @@ function promptRet.create(title, description, primary, secondary, callback)
 	end)
 	
 	prompt.Policy.Actions.Primary.Interact.MouseEnter:Connect(function()
+		if debounce then return end
 		tweenService:Create(prompt.Policy.Actions.Primary, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
 		tweenService:Create(prompt.Policy.Actions.Primary.Title, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
 		tweenService:Create(prompt.Policy.Actions.Primary.Shadow, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0.45}):Play()
 	end)
 	
 	prompt.Policy.Actions.Primary.Interact.MouseLeave:Connect(function()
+		if debounce then return end
 		tweenService:Create(prompt.Policy.Actions.Primary, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0.2}):Play()
 		tweenService:Create(prompt.Policy.Actions.Primary.Title, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.2}):Play()
 		tweenService:Create(prompt.Policy.Actions.Primary.Shadow, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0.7}):Play()
 	end)
 
 	prompt.Policy.Actions.Secondary.Interact.MouseEnter:Connect(function()
+		if debounce then return end
 		tweenService:Create(prompt.Policy.Actions.Secondary.Title, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.3}):Play()
 	end)
 	
 	prompt.Policy.Actions.Secondary.Interact.MouseLeave:Connect(function()
+		if debounce then return end
 		tweenService:Create(prompt.Policy.Actions.Secondary.Title, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.6}):Play()
 	end)
 	
