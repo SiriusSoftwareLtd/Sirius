@@ -25,6 +25,7 @@ local function open(prompt)
 	prompt.Policy.Actions.Secondary.Title.TextTransparency = 1
 	
 	-- Show the prompt
+	prompt.Policy.Visible = true
 	prompt.Enabled = true
 	
 	tweenService:Create(prompt.Policy, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
