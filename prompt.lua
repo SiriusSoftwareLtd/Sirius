@@ -4,6 +4,7 @@ local useStudio
 
 local runService = game:GetService("RunService")
 local coreGui = game:GetService('CoreGui')
+local fin
 local tweenService = game:GetService('TweenService')
 
 if runService:IsStudio() then
@@ -45,11 +46,13 @@ local function open(prompt)
 	tweenService:Create(prompt.Policy.Actions.Primary, TweenInfo.new(0.6, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0.3}):Play()
 	tweenService:Create(prompt.Policy.Actions.Primary.Title, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.2}):Play()
 	tweenService:Create(prompt.Policy.Actions.Primary.Shadow, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0.7}):Play()
-	
+
 	task.wait(5)
 	
-	tweenService:Create(prompt.Policy.Actions.Secondary.Title, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.6}):Play()
-	debounce = false
+	if not fin then
+		tweenService:Create(prompt.Policy.Actions.Secondary.Title, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0.6}):Play()
+		debounce = false
+	end
 end
 
 local function close(prompt)
@@ -71,6 +74,7 @@ local function close(prompt)
 	task.wait(1)
 	
 	prompt:Destroy()
+	fin = true
 end
 
 
@@ -150,7 +154,7 @@ function promptRet.create(title, description, primary, secondary, callback)
 	
 	task.wait(0.5)
 
-	open(prompt)
+	task.spawn(open, prompt)
 end
 
 return promptRet
