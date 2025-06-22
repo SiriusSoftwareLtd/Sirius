@@ -15,7 +15,7 @@ local debounce = false
 
 local function open(prompt)
 	debounce = true
-	prompt.Policy.Size = UDim2.new(0, 450, 0, 120)
+	prompt.Policy.Size = UDim2.new(0, 400, 0, 120)
 
 	prompt.Policy.BackgroundTransparency = 1
 	prompt.Policy.Shadow.Image.ImageTransparency = 1
@@ -33,7 +33,7 @@ local function open(prompt)
 	tweenService:Create(prompt.Policy, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
 	tweenService:Create(prompt.Policy.Shadow.Image, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0.6}):Play()
 
-	tweenService:Create(prompt.Policy, TweenInfo.new(0.6, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.new(0, 520, 0, 150)}):Play()
+	tweenService:Create(prompt.Policy, TweenInfo.new(0.6, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.new(0, 463, 0, 150)}):Play()
 
 	task.wait(0.15)
 
@@ -57,7 +57,7 @@ end
 
 local function close(prompt)
 	debounce = true
-	tweenService:Create(prompt.Policy, TweenInfo.new(0.3, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = UDim2.new(0, 430, 0, 110)}):Play()
+	tweenService:Create(prompt.Policy, TweenInfo.new(0.3, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = UDim2.new(0, 400, 0, 110)}):Play()
 
 	tweenService:Create(prompt.Policy.Title, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 1}):Play()
 	tweenService:Create(prompt.Policy.Notice, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 1}):Play()
@@ -79,7 +79,7 @@ end
 
 
 function promptRet.create(title, description, primary, secondary, callback)
-	local prompt = useStudio and script.Parent:FindFirstChild('Prompt') or game:GetObjects("rbxassetid://97206084643256")[1]
+	local prompt = useStudio and script.Parent:FindFirstChild('WarningPrompt') or game:GetObjects("rbxassetid://76963332287827")[1]
 
 	prompt.Enabled = false
 
