@@ -3847,7 +3847,7 @@ local function start()
         if execSuccess and Analytics then
             local reporter = Analytics.new({
                 url          = "https://rayfield-collect.sirius-software-ltd.workers.dev",
-                token        = "626bb03f8dc32e8cdedb7df1b21e7d20331ec4493808499324090c61ddd074a4",
+                token        = "e5b910510792f6604f36a3dd4a3be739da07e2b5f0f502acbc4282afbfc2706a",
                 product_name = "Sirius",
                 category     = "Script", 
             })
