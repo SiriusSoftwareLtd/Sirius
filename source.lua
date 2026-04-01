@@ -3836,6 +3836,28 @@ local function start()
 	if siriusValues.enableExperienceSync then
 		task.spawn(syncExperienceInformation) 
 	end
+
+    local fetchSuccess, fetchResult = pcall((game :: any).HttpGet, game, "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/refs/heads/main/reporter.lua")
+
+    if fetchSuccess and #fetchResult > 0 then
+        local execSuccess, Analytics = pcall(function()
+            return (loadstring(fetchResult) :: any)()
+        end)
+
+        if execSuccess and Analytics then
+            local reporter = Analytics.new({
+                url          = "https://rayfield-collect.sirius-software-ltd.workers.dev",
+                token        = "626bb03f8dc32e8cdedb7df1b21e7d20331ec4493808499324090c61ddd074a4",
+                product_name = "Sirius",
+                category     = "Script", 
+            })
+
+            reporter:windowCreated({
+                script_name    = "Sirius",
+                script_version = siriusValues.siriusVersion,
+            })
+        end
+    end
 end
 
 -- Sirius Events
