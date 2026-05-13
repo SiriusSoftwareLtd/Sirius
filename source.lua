@@ -2,7 +2,7 @@
 
 Sirius
 
-© 2024 Sirius 
+© 2026 Corridon Capital. 
 All Rights Reserved.
 
 --]]
@@ -73,6 +73,7 @@ local smartBarOpen = false
 local debounce = false
 local searchingForPlayer = false
 local musicQueue = {}
+local playGeneration = 0 -- bumped to invalidate parked Ended:Wait coroutines in playNext
 local currentAudio
 local lowerName = localPlayer.Name:lower()
 local lowerDisplayName = localPlayer.DisplayName:lower()
@@ -85,11 +86,14 @@ local noclipDefaults = {}
 local movers = {}
 local creatorType = game.CreatorType
 local espContainer = Instance.new("Folder", gethui and gethui() or coreGui)
+local locatedPlayers = {} -- per-player ESP toggles, independent from the global ESP action
+local espConnections = {} -- [player] = RBXScriptConnection for CharacterAdded
+local descendantAddedConn -- top-level DescendantAdded; tracked so we can disconnect on teardown
 local oldVolume = gameSettings.MasterVolume
 
 -- Configurable Core Values
 local siriusValues = {
-	siriusVersion = "1.26",
+	siriusVersion = "1.27",
 	siriusName = "Sirius",
 	releaseType = "Stable",
 	siriusFolder = "Sirius",
@@ -274,7 +278,9 @@ local siriusValues = {
 					primaryPart.AssemblyLinearVelocity = Vector3.zero
 					primaryPart.AssemblyAngularVelocity = Vector3.zero
 
-					movers[3].Parent = value and primaryPart or nil
+					if movers[3] then
+						movers[3].Parent = value and primaryPart or nil
+					end
 
 					task.delay(0.5, function() primaryPart.Anchored = false end)
 				end
@@ -288,7 +294,7 @@ local siriusValues = {
 			rotateWhileEnabled = false,
 			callback = function(value)
 				for _, highlight in ipairs(espContainer:GetChildren()) do
-					highlight.Enabled = value
+					highlight.Enabled = value or locatedPlayers[highlight.Name] == true
 				end
 			end,
 		},
@@ -1072,7 +1078,9 @@ local function fetchIcon(iconName)
 end
 
 local function storeOriginalText(element)
-	originalTextValues[element] = element.Text
+	if originalTextValues[element] == nil then
+		originalTextValues[element] = element.Text
+	end
 end
 
 local function undoAnonymousChanges()
@@ -1081,8 +1089,12 @@ local function undoAnonymousChanges()
 	end
 end
 
+local function isHighlightEnabledFor(playerName)
+	return siriusValues.actions[7].enabled or locatedPlayers[playerName] == true
+end
+
 local function createEsp(player)
-	if player == localPlayer or not checkSirius() then 
+	if player == localPlayer or not checkSirius() then
 		return
 	end
 
@@ -1092,10 +1104,13 @@ local function createEsp(player)
 	highlight.OutlineColor = Color3.new(1,1,1)
 	highlight.Adornee = player.Character
 	highlight.Name = player.Name
-	highlight.Enabled = siriusValues.actions[7].enabled
+	highlight.Enabled = isHighlightEnabledFor(player.Name)
 	highlight.Parent = espContainer
 
-	player.CharacterAdded:Connect(function(character)
+	if espConnections[player] then
+		espConnections[player]:Disconnect()
+	end
+	espConnections[player] = player.CharacterAdded:Connect(function(character)
 		if not checkSirius() then return end
 		task.wait()
 		highlight.Adornee = character
@@ -1246,7 +1261,7 @@ local function figureNotifications()
 			blurSignature(false)
 		end
 
-		for i = #notifications, 0, -1 do
+		for i = #notifications, 1, -1 do
 			local notification = notifications[i]
 			if notification then
 				if notificationsSize == 0 then
@@ -1382,7 +1397,14 @@ local function removeReverbs(timing)
 end
 
 local function playNext()
-	if #musicQueue == 0 then currentAudio.Playing = false currentAudio.SoundId = "" musicPanel.Playing.Text = "Not Playing" return end
+	playGeneration += 1
+	local thisGen = playGeneration
+
+	if #musicQueue == 0 then
+		if currentAudio then currentAudio.Playing = false currentAudio.SoundId = "" end
+		musicPanel.Playing.Text = "Not Playing"
+		return
+	end
 
 	if not currentAudio then
 		local newAudio = Instance.new("Sound")
@@ -1405,6 +1427,8 @@ local function playNext()
 	currentAudio:Play()
 	musicPanel.Menu.TogglePlaying.ImageRectOffset = currentAudio.Playing and Vector2.new(804, 124) or Vector2.new(764, 244)
 	currentAudio.Ended:Wait()
+
+	if thisGen ~= playGeneration then return end -- superseded by Next/skip; let the active call do the table.remove
 
 	table.remove(musicQueue, 1)
 
@@ -1454,7 +1478,7 @@ local function addToQueue(file)
 	end)
 
 	newAudio.Close.MouseButton1Click:Connect(function()
-		if not string.find(currentAudio.Name, file) then
+		if not currentAudio or not string.find(currentAudio.Name, file) then
 			for i,v in pairs(musicQueue) do
 				for _,b in pairs(v) do
 					if b == newAudio.Name then
@@ -2632,6 +2656,8 @@ local function createScript(result)
 			response = httpService:JSONDecode(responseRequest.Body)
 		end)
 
+		if not success or not response or not response.script then return end
+
 		newScript.ScriptDescription.Text = response.script.features
 
 		local likes = response.script.likeCount
@@ -2791,7 +2817,7 @@ local function securityDetection(title, content, link, gradient, actions)
 		tweenService:Create(newSecurityPrompt.FoundLink, TweenInfo.new(0.5, Enum.EasingStyle.Quint),  {TextTransparency = 0.2}):Play()
 	end)
 
-	repeat task.wait() until decision
+	repeat task.wait() until decision ~= nil
 	return decision
 end
 
@@ -3039,7 +3065,8 @@ local function onChatted(player, message)
 		local hidden = true
 
 		local get = getMessage.OnClientEvent:Connect(function(packet, channel)
-			if packet.SpeakerUserId == player.UserId and packet.Message == message2:sub(#message2-#packet.Message+1) and (channel=="All" or (channel=="Team" and players[packet.FromSpeaker].Team == localPlayer.Team)) then
+			local speakerPlayer = packet.FromSpeaker and players:FindFirstChild(packet.FromSpeaker)
+			if packet.SpeakerUserId == player.UserId and packet.Message == message2:sub(#message2-#packet.Message+1) and (channel=="All" or (channel=="Team" and speakerPlayer and speakerPlayer.Team == localPlayer.Team)) then
 				hidden = false
 			end
 		end)
@@ -3104,23 +3131,26 @@ local function kill(player)
 end
 
 local function teleportTo(player)
-	if players:FindFirstChild(player.Name) then
-		queueNotification("Teleportation", "Teleporting to "..player.DisplayName..".")
+	local targetCharacter = workspace:FindFirstChild(player.Name)
+	local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+	local localCharacter = localPlayer.Character
+	local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
 
-		local target = workspace:FindFirstChild(player.Name).HumanoidRootPart
-		localPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(target.Position.X, target.Position.Y, target.Position.Z)
+	if players:FindFirstChild(player.Name) and targetRoot and localRoot then
+		queueNotification("Teleportation", "Teleporting to "..player.DisplayName..".")
+		localRoot.CFrame = CFrame.new(targetRoot.Position.X, targetRoot.Position.Y, targetRoot.Position.Z)
 	else
-		queueNotification("Teleportation Error", player.DisplayName.." has left this server.")
+		queueNotification("Teleportation Error", player.DisplayName.." cannot be teleported to right now.")
 	end
 end
 
 local function createPlayer(player)
 	if not checkSirius() then return end
 
-	if playerlistPanel.Interactions.List:FindFirstChild(player.DisplayName) then return end
+	if playerlistPanel.Interactions.List:FindFirstChild(player.Name) then return end
 
 	local newPlayer = playerlistPanel.Interactions.List.Template:Clone()
-	newPlayer.Name = player.DisplayName
+	newPlayer.Name = player.Name
 	newPlayer.Parent = playerlistPanel.Interactions.List
 	newPlayer.Visible = not searchingForPlayer
 
@@ -3258,16 +3288,35 @@ local function createPlayer(player)
 	end)
 
 	newPlayer.PlayerInteractions.Locate.Interact.MouseButton1Click:Connect(function()
-		queueNotification("Simulation Notification","Simulating Locate ESP Notification for "..player.DisplayName..".")
-		-- ESP for that user only
+		locatedPlayers[player.Name] = not locatedPlayers[player.Name] or nil
+		local nowLocating = locatedPlayers[player.Name] == true
+
+		local highlight = espContainer:FindFirstChild(player.Name)
+		if highlight then
+			highlight.Enabled = isHighlightEnabledFor(player.Name)
+		end
+
+		local activeColor = Color3.fromRGB(0, 152, 111)
+		local idleColor = Color3.fromRGB(50, 50, 50)
+		local activeStroke = Color3.fromRGB(0, 152, 111)
+		local idleStroke = Color3.fromRGB(60, 60, 60)
+		local activeIcon = Color3.fromRGB(220, 220, 220)
+		local idleIcon = Color3.fromRGB(100, 100, 100)
+
+		tweenService:Create(newPlayer.PlayerInteractions.Locate, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {BackgroundColor3 = nowLocating and activeColor or idleColor}):Play()
+		tweenService:Create(newPlayer.PlayerInteractions.Locate.Icon, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {ImageColor3 = nowLocating and activeIcon or idleIcon}):Play()
+		tweenService:Create(newPlayer.PlayerInteractions.Locate.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Color = nowLocating and activeStroke or idleStroke}):Play()
+
+		queueNotification(nowLocating and "Now Tracking" or "Stopped Tracking", (nowLocating and "Now tracking " or "Stopped tracking ")..player.DisplayName..".")
 	end)
 end
 
 local function removePlayer(player)
 	if not checkSirius() then return end
 
-	if playerlistPanel.Interactions.List:FindFirstChild(player.Name) then
-		playerlistPanel.Interactions.List:FindFirstChild(player.Name):Destroy()
+	local entry = playerlistPanel.Interactions.List:FindFirstChild(player.Name)
+	if entry then
+		entry:Destroy()
 	end
 end
 
@@ -3371,7 +3420,7 @@ end
 local function saveSettings()
 	checkFolder()
 
-	if isfile and isfile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile) then
+	if writefile then
 		writefile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile, httpService:JSONEncode(siriusSettings))
 	end
 end
@@ -3408,6 +3457,17 @@ local function assembleSettings()
 		end 
 	end
 
+	settingsPanel.Back.MouseButton1Click:Connect(function()
+		tweenService:Create(settingsPanel.Back, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
+		tweenService:Create(settingsPanel.Back, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Position = UDim2.new(0.002, 0, 0.052, 0)}):Play()
+		tweenService:Create(settingsPanel.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Position = UDim2.new(0.045, 0, 0.057, 0)}):Play()
+		tweenService:Create(settingsPanel.UIGradient, TweenInfo.new(1, Enum.EasingStyle.Exponential), {Offset = Vector2.new(0, 1.3)}):Play()
+		settingsPanel.Title.Text = "Settings"
+		settingsPanel.Subtitle.Text = "Adjust your preferences, set new keybinds, test out new features and more"
+		settingsPanel.SettingTypes.Visible = true
+		settingsPanel.SettingLists.Visible = false
+	end)
+
 	for _, category in siriusSettings do
 		local newCategory = settingsPanel.SettingTypes.Template:Clone()
 		newCategory.Name = category.name
@@ -3432,17 +3492,6 @@ local function assembleSettings()
 		newList.Visible = true
 
 		for _, obj in ipairs(newList:GetChildren()) do if obj.Name ~= "Placeholder" and obj.Name ~= "UIListLayout" then obj:Destroy() end end 
-
-		settingsPanel.Back.MouseButton1Click:Connect(function()
-			tweenService:Create(settingsPanel.Back, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
-			tweenService:Create(settingsPanel.Back, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Position = UDim2.new(0.002, 0, 0.052, 0)}):Play()
-			tweenService:Create(settingsPanel.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Position = UDim2.new(0.045, 0, 0.057, 0)}):Play()
-			tweenService:Create(settingsPanel.UIGradient, TweenInfo.new(1, Enum.EasingStyle.Exponential), {Offset = Vector2.new(0, 1.3)}):Play()
-			settingsPanel.Title.Text = "Settings"
-			settingsPanel.Subtitle.Text = "Adjust your preferences, set new keybinds, test out new features and more"
-			settingsPanel.SettingTypes.Visible = true
-			settingsPanel.SettingLists.Visible = false
-		end)
 
 		newCategory.Interact.MouseButton1Click:Connect(function()
 			if settingsPanel.SettingLists:FindFirstChild(category.name) then
@@ -3571,7 +3620,7 @@ local function assembleSettings()
 							end
 						end
 
-						if newInput.InputFrame.InputBox.Text ~= nil or "" then
+						if newInput.InputFrame.InputBox.Text ~= nil and newInput.InputFrame.InputBox.Text ~= "" then
 							setting.current = newInput.InputFrame.InputBox.Text
 							saveSettings()
 						end
@@ -3890,7 +3939,9 @@ playerSearch:GetPropertyChangedSignal("Text"):Connect(function()
 
 	for _, player in ipairs(playerlistPanel.Interactions.List:GetChildren()) do
 		if player.ClassName == "Frame" and player.Name ~= "Placeholder" and player.Name ~= "Template" then
-			if string.find(player.Name, playerSearch.Text) then
+			local displayName = player:FindFirstChild("DisplayName")
+			local displayText = displayName and string.lower(displayName.Text) or ""
+			if string.find(string.lower(player.Name), query, 1, true) or string.find(displayText, query, 1, true) then
 				player.Visible = true
 			else
 				player.Visible = false
@@ -4248,7 +4299,7 @@ players.PlayerAdded:Connect(function(player)
 
 	if checkSetting("Log PlayerAdded and PlayerRemoving").current then
 		local logData = {
-			["content"] = player.DisplayName.." (@"..player.Name..") left the server.",
+			["content"] = player.DisplayName.." (@"..player.Name..") joined the server.",
 			["avatar_url"] = "https://www.roblox.com/headshot-thumbnail/image?userId="..player.UserId.."&width=420&height=420&format=png",
 			["username"] = player.DisplayName,
 			["allowed_mentions"] = {parse = {}}
@@ -4292,7 +4343,7 @@ end)
 players.PlayerRemoving:Connect(function(player)
 	if checkSetting("Log PlayerAdded and PlayerRemoving").current then
 		local logData = {
-			["content"] = player.DisplayName.." (@"..player.Name..") joined the server.",
+			["content"] = player.DisplayName.." (@"..player.Name..") left the server.",
 			["avatar_url"] = "https://www.roblox.com/headshot-thumbnail/image?userId="..player.UserId.."&width=420&height=420&format=png",
 			["username"] = player.DisplayName,
 			["allowed_mentions"] = {parse = {}}
@@ -4313,6 +4364,12 @@ players.PlayerRemoving:Connect(function(player)
 	end
 
 	removePlayer(player)
+	locatedPlayers[player.Name] = nil
+
+	if espConnections[player] then
+		espConnections[player]:Disconnect()
+		espConnections[player] = nil
+	end
 
 	local highlight = espContainer:FindFirstChild(player.Name)
 	if highlight then
@@ -4345,14 +4402,12 @@ runService.Stepped:Connect(function()
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
 				if noclipDefaults[part] == nil then
-					task.wait()
-					noclipDefaults[part] = part.CanCollide
+					noclipDefaults[part] = part.CanCollide -- capture before any toggle can race in
+				end
+				if noclipEnabled or flingEnabled then
+					part.CanCollide = false
 				else
-					if noclipEnabled or flingEnabled then
-						part.CanCollide = false
-					else
-						part.CanCollide = noclipDefaults[part]
-					end
+					part.CanCollide = noclipDefaults[part]
 				end
 			end
 		end
@@ -4366,6 +4421,17 @@ runService.Heartbeat:Connect(function()
 	local primaryPart = character and character.PrimaryPart
 	if primaryPart then
 		local bodyVelocity, bodyGyro = unpack(movers)
+
+		-- Drop cached movers if the old character was destroyed and took them with it.
+		-- Setting Parent on a destroyed instance throws, so probe before using.
+		if bodyVelocity then
+			local alive = pcall(function() bodyVelocity.Parent = bodyVelocity.Parent end)
+			if not alive then
+				movers = {}
+				bodyVelocity, bodyGyro = nil, nil
+			end
+		end
+
 		if not bodyVelocity then
 			bodyVelocity = Instance.new("BodyVelocity")
 			bodyVelocity.MaxForce = Vector3.one * 9e9
@@ -4426,17 +4492,25 @@ runService.Heartbeat:Connect(function()
 	end
 end)
 
+-- Anonymous Client throttle/transition state
+local anonymousTickCounter = 0
+local anonymousWasEnabled = false
+local ANONYMOUS_TICK_INTERVAL = 15 -- run roughly 4x/sec instead of every frame
+
 runService.Heartbeat:Connect(function(frame)
 	if not checkSirius() then return end
 	if Pro then
 		if checkSetting("Spatial Shield").current and tonumber(checkSetting("Spatial Shield Threshold").current) then
-			for index, sound in next, soundInstances do
+			local threshold = tonumber(checkSetting("Spatial Shield Threshold").current)
+			-- iterate backwards so table.remove doesn't skip entries
+			for i = #soundInstances, 1, -1 do
+				local sound = soundInstances[i]
 				if not sound then
-					table.remove(soundInstances, index)
-				elseif gameSettings.MasterVolume * sound.PlaybackLoudness * sound.Volume >= tonumber(checkSetting("Spatial Shield Threshold").current) then
-					if sound.Volume > 0.55 then 
+					table.remove(soundInstances, i)
+				elseif gameSettings.MasterVolume * sound.PlaybackLoudness * sound.Volume >= threshold then
+					if sound.Volume > 0.55 then
 						suppressedSounds[sound.SoundId] = "S"
-						sound.Volume = 0.5 	
+						sound.Volume = 0.5
 					elseif sound.Volume > 0.2 and sound.Volume < 0.55 then
 						suppressedSounds[sound.SoundId] = "S2"
 						sound.Volume = 0.1
@@ -4445,29 +4519,51 @@ runService.Heartbeat:Connect(function(frame)
 						sound.Volume = 0
 					end
 					if soundSuppressionNotificationCooldown == 0 then
-						queueNotification("Spatial Shield","A high-volume audio is being played ("..sound.Name..") and it has been suppressed.", 4483362458) 
+						queueNotification("Spatial Shield","A high-volume audio is being played ("..sound.Name..") and it has been suppressed.", 4483362458)
 						soundSuppressionNotificationCooldown = 15
 					end
-					table.remove(soundInstances, index)
+					table.remove(soundInstances, i)
 				end
 			end
 		end
+
+		if soundSuppressionNotificationCooldown > 0 then
+			soundSuppressionNotificationCooldown -= 1
+		end
 	end
 
-	if checkSetting("Anonymous Client").current then
-		for _, text in ipairs(cachedText) do
-			local lowerText = string.lower(text.Text)
-			if string.find(lowerText, lowerName, 1, true) or string.find(lowerText, lowerDisplayName, 1, true) then
+	local anonymousEnabled = checkSetting("Anonymous Client").current
 
-				storeOriginalText(text)
+	if anonymousEnabled then
+		-- Throttle: do the scan on every Nth heartbeat rather than every frame.
+		anonymousTickCounter += 1
+		if anonymousTickCounter >= ANONYMOUS_TICK_INTERVAL then
+			anonymousTickCounter = 0
 
-				local newText = string.gsub(string.gsub(lowerText, lowerName, randomUsername), lowerDisplayName, randomUsername)
-				text.Text = string.gsub(newText, "^%l", string.upper)
+			for i = #cachedText, 1, -1 do
+				local text = cachedText[i]
+				if not text or not text.Parent then
+					-- Drop destroyed/orphaned labels so we stop scanning them.
+					table.remove(cachedText, i)
+				elseif originalTextValues[text] == nil then
+					-- Only inspect labels we haven't already anonymized.
+					local raw = text.Text
+					local lowerText = string.lower(raw)
+					if string.find(lowerText, lowerName, 1, true) or string.find(lowerText, lowerDisplayName, 1, true) then
+						storeOriginalText(text)
+						local newText = string.gsub(string.gsub(lowerText, lowerName, randomUsername), lowerDisplayName, randomUsername)
+						text.Text = string.gsub(newText, "^%l", string.upper)
+					end
+				end
 			end
 		end
-	else
+	elseif anonymousWasEnabled then
+		-- Only undo once on the off-transition, not every frame.
 		undoAnonymousChanges()
+		table.clear(originalTextValues)
 	end
+
+	anonymousWasEnabled = anonymousEnabled
 end)
 
 for _, instance in next, game:GetDescendants() do
@@ -4493,7 +4589,7 @@ for _, instance in next, game:GetDescendants() do
 	end
 end
 
-game.DescendantAdded:Connect(function(instance)
+descendantAddedConn = game.DescendantAdded:Connect(function(instance)
 	if checkSirius() then
 		if instance:IsA("Sound") then
 			if suppressedSounds[instance.SoundId] then
@@ -4522,6 +4618,11 @@ end)
 while task.wait(1) do
 	if not checkSirius() then
 		if espContainer then espContainer:Destroy() end
+		if descendantAddedConn then descendantAddedConn:Disconnect() descendantAddedConn = nil end
+		for player, conn in pairs(espConnections) do
+			conn:Disconnect()
+			espConnections[player] = nil
+		end
 		undoAnonymousChanges()
 		break
 	end
