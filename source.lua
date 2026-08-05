@@ -5122,6 +5122,17 @@ local function teardown()
 	end
 	table.clear(connections)
 
+	-- Restore CanCollide before dropping the cache. The Stepped handler would normally do this
+	-- on the trailing edge, but it has just been disconnected, so nothing else will.
+	pcall(function()
+		for part in pairs(characterParts) do
+			if part.Parent then
+				local default = noclipDefaults[part]
+				part.CanCollide = if default == nil then true else default
+			end
+		end
+	end)
+
 	clearCharacterPartTracking()
 	undoAnonymousChanges()
 	table.clear(originalTextValues)
