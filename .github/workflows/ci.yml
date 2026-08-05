@@ -1,0 +1,33 @@
+name: CI
+permissions:
+  contents: read
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: Lint, Format and Analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup RoKit
+        uses: CompeyDev/setup-rokit@v0.1.2
+
+      - name: Install RoKit packages
+        run: rokit install --no-trust-check
+
+      - name: Check formatting
+        run: stylua --check source.lua boost.lua prompt.lua
+
+      - name: Lint
+        run: |
+          selene generate-roblox-std
+          selene source.lua boost.lua prompt.lua
+
+      - name: Analyze
+        run: |
+          curl -sSL -o globalTypes.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/main/scripts/globalTypes.d.luau
+          luau-lsp analyze --definitions=globalTypes.d.luau --no-strict-dm-types \
+            --ignore="**/globalTypes.d.luau" source.lua boost.lua prompt.lua

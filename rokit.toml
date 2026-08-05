@@ -1,0 +1,7 @@
+# Rokit for Sirius
+# Mirrors the toolchain pinned by Rayfield-gen2 so both repos lint identically.
+
+[tools]
+StyLua = "JohnnyMorganz/StyLua@2.5.2"
+selene = "Kampfkarren/selene@0.31.0"
+luau-lsp = "JohnnyMorganz/luau-lsp@1.68.1"

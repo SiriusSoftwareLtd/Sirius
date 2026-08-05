@@ -38,7 +38,7 @@ Potential Future Setting Options
  
 --]]
 
--- Ensure the game is loaded 
+-- Ensure the game is loaded
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
@@ -46,28 +46,152 @@ end
 -- Check License Tier
 local Pro = true -- We're open sourced now!
 
+-- Executor Feature Detection
+-- Optional globals vary wildly between executors, so every one is resolved through a
+-- typeof() check up front. Anything missing stays nil and every call site guards on it,
+-- which stops a single absent function from aborting startup for the whole script.
+local function optional(value)
+	return typeof(value) == "function" and value or nil
+end
+
+local setFpsCap = optional(setfpscap)
+local getExecutorName = optional(identifyexecutor)
+local getCustomAsset = optional(getcustomasset)
+local getConnectionsFor = optional(getconnections)
+local hookMetamethod = optional(hookmetamethod)
+local getHiddenUI = optional(gethui)
+local cloneRef = optional(cloneref)
+local getEnv = optional(getgenv)
+
+-- The executor's shared environment. Falls back to _G so the caches and re-run sentinels
+-- still have somewhere to live on executors that don't expose getgenv.
+local env = getEnv and getEnv() or _G
+
+-- Prefer the executor's own service clones where available; a cloneref'd handle isn't
+-- reachable from the game's own scripts, which is what the "reduce detection" TODO wants.
+local function getService(name)
+	local service = game:GetService(name)
+	return cloneRef and cloneRef(service) or service
+end
+
 -- Create Variables for Roblox Services
-local coreGui = game:GetService("CoreGui")
-local httpService = game:GetService("HttpService")
-local lighting = game:GetService("Lighting")
-local players = game:GetService("Players")
-local replicatedStorage = game:GetService("ReplicatedStorage")
-local runService = game:GetService("RunService")
-local guiService = game:GetService("GuiService")
-local statsService = game:GetService("Stats")
-local starterGui = game:GetService("StarterGui")
-local teleportService = game:GetService("TeleportService")
-local tweenService = game:GetService("TweenService")
-local userInputService = game:GetService('UserInputService')
+local coreGui = getService("CoreGui")
+local httpService = getService("HttpService")
+local lighting = getService("Lighting")
+local players = getService("Players")
+local replicatedStorage = getService("ReplicatedStorage")
+local runService = getService("RunService")
+local guiService = getService("GuiService")
+local statsService = getService("Stats")
+local starterGui = getService("StarterGui")
+local teleportService = getService("TeleportService")
+local tweenService = getService("TweenService")
+local userInputService = getService('UserInputService')
+local textChatService = getService("TextChatService")
+local marketplaceService = getService("MarketplaceService")
 local gameSettings = UserSettings():GetService("UserGameSettings")
+
+local useStudio = runService:IsStudio()
+
+-- Loads and executes a function hosted on a remote URL, cancelling the request if the URL
+-- takes too long to respond. Ported from Rayfield so a slow CDN can't stall startup.
+local function loadWithTimeout(url, timeout)
+	assert(type(url) == "string", "Expected string, got " .. type(url))
+	timeout = timeout or 5
+	local requestCompleted = false
+	local success, result = false, nil
+
+	local requestThread = task.spawn(function()
+		local fetchSuccess, fetchResult = pcall(game.HttpGet, game, url)
+		-- A "successful" request can still come back empty
+		if not fetchSuccess or #fetchResult == 0 then
+			if fetchSuccess and #fetchResult == 0 then
+				fetchResult = "Empty response"
+			end
+			success, result = false, fetchResult
+			requestCompleted = true
+			return
+		end
+
+		local execSuccess, execResult = pcall(function()
+			return loadstring(fetchResult)()
+		end)
+		success, result = execSuccess, execResult
+		requestCompleted = true
+	end)
+
+	local timeoutThread = task.delay(timeout, function()
+		if not requestCompleted then
+			warn("Sirius | Request for " .. url .. " timed out after " .. tostring(timeout) .. " seconds")
+			task.cancel(requestThread)
+			result = "Request timed out"
+			requestCompleted = true
+		end
+	end)
+
+	while not requestCompleted do
+		task.wait()
+	end
+
+	if coroutine.status(timeoutThread) ~= "dead" then
+		task.cancel(timeoutThread)
+	end
+
+	if not success then
+		warn("Sirius | Failed to process " .. tostring(url) .. ": " .. tostring(result))
+		return nil
+	end
+
+	return result
+end
+
+-- Every connection Sirius opens is registered here so teardown can close all of them at once.
+local connections = {}
+local function track(connection)
+	table.insert(connections, connection)
+	return connection
+end
+
+-- Case-insensitive literal replace. string.gsub treats its needle as a Lua pattern, so names
+-- containing -, ., ( or % broke or errored; this walks plain-text matches instead.
+local function replacePlain(haystack, needleLower, replacement)
+	if needleLower == "" then return haystack end
+
+	local lowered = string.lower(haystack)
+	local out, cursor = {}, 1
+
+	while true do
+		local startIndex, endIndex = string.find(lowered, needleLower, cursor, true)
+		if not startIndex then break end
+
+		table.insert(out, string.sub(haystack, cursor, startIndex - 1))
+		table.insert(out, replacement)
+		cursor = endIndex + 1
+	end
+
+	if cursor == 1 then return haystack end
+
+	table.insert(out, string.sub(haystack, cursor))
+	return table.concat(out)
+end
+
+-- Shortens a value for display only. The stored value is never overwritten with the result.
+local function truncateForDisplay(value, limit)
+	local text = tostring(value)
+	limit = limit or 24
+	if #text <= limit then return text end
+	return string.sub(text, 1, limit - 2)..".."
+end
 
 -- Variables
 local camera = workspace.CurrentCamera
 local getMessage = replicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 1) and replicatedStorage.DefaultChatSystemChatEvents:WaitForChild("OnMessageDoneFiltering", 1)
+-- Roblox retired the legacy chat system; anything built on DefaultChatSystemChatEvents only
+-- works in experiences still opted into it. Checked once here rather than at each call site.
+local legacyChatActive = getMessage ~= nil and textChatService.ChatVersion == Enum.ChatVersion.LegacyChatService
 local localPlayer = players.LocalPlayer
 local notifications = {}
 local friendsCooldown = 0
-local mouse = localPlayer:GetMouse()
 local promptedDisconnected = false
 local smartBarOpen = false
 local debounce = false
@@ -85,15 +209,19 @@ local creatorId = game.CreatorId
 local noclipDefaults = {}
 local movers = {}
 local creatorType = game.CreatorType
-local espContainer = Instance.new("Folder", gethui and gethui() or coreGui)
+local espContainer = Instance.new("Folder", getHiddenUI and getHiddenUI() or coreGui)
+espContainer.Name = "SiriusESP"
 local locatedPlayers = {} -- per-player ESP toggles, independent from the global ESP action
 local espConnections = {} -- [player] = RBXScriptConnection for CharacterAdded
 local descendantAddedConn -- top-level DescendantAdded; tracked so we can disconnect on teardown
 local oldVolume = gameSettings.MasterVolume
+local baseFieldOfView = camera.FieldOfView -- captured once; Home restores to this rather than doing relative maths
+local homeFieldOfView -- the FOV in effect when Home was last opened
+local placeName -- resolved once at startup so the JobId copy button never yields on click
 
 -- Configurable Core Values
 local siriusValues = {
-	siriusVersion = "1.27",
+	siriusVersion = "1.28",
 	siriusName = "Sirius",
 	releaseType = "Stable",
 	siriusFolder = "Sirius",
@@ -101,53 +229,10 @@ local siriusValues = {
 	interfaceAsset = 14183548964,
 	cdn = "https://cdn.sirius.menu/SIRIUS-SCRIPT-CORE-ASSETS/",
 	icons = "https://cdn.sirius.menu/SIRIUS-SCRIPT-CORE-ASSETS/Icons/",
-	enableExperienceSync = false, -- Games are no longer available due to a lack of whitelisting, they may be made open source at a later date, however they are patched as of now and are useless to the end user. Turning this on may introduce "fake functionality".
-	games = {
-		BreakingPoint = {
-			name = "Breaking Point",
-			description = "Players are seated around a table. Their only goal? To be the last one standing. Execute this script to gain an unfair advantage.",
-			id = 648362523,
-			enabled = true,
-			raw = "BreakingPoint",
-			minimumTier = "Free",
-		},
-		MurderMystery2 = {
-			name = "Murder Mystery 2",
-			description = "A murder has occured, will you be the one to find the murderer, or kill your next victim? Execute this script to gain an unfair advantage.",
-			id = 142823291,
-			enabled = true,
-			raw = "MurderMystery2",
-			minimumTier = "Free",
-		},
-		TowerOfHell = {
-			name = "Tower Of Hell",
-			description = "A difficult popular parkouring game, with random levels and modifiers. Execute this script to gain an unfair advantage.",
-			id = 1962086868,
-			enabled = true,
-			raw = "TowerOfHell",
-			minimumTier = "Free",
-		},
-		Strucid = {
-			name = "Strucid",
-			description = "Fight friends and enemies in Strucid with building mechanics! Execute this script to gain an unfair advantage.",
-			id = 2377868063,
-			enabled = true,
-			raw = "Strucid",
-			minimumTier = "Free",
-		},
-		PhantomForces = {
-			name = "Phantom Forces",
-			description = "One of the most popular FPS shooters from the team at StyLiS Studios. Execute this script to gain an unfair advantage.",
-			id = 292439477,
-			enabled = true,
-			raw = "PhantomForces",
-			minimumTier = "Pro",
-		},
-	},
-	rawTree = "https://raw.githubusercontent.com/SiriusSoftwareLtd/Sirius/Sirius/games/",
-	neonModule = "https://raw.githubusercontent.com/shlexware/Sirius/request/library/neon.lua",
-	senseRaw = "https://raw.githubusercontent.com/shlexware/Sirius/request/library/sense/source.lua",
-	executors = {"synapse x", "script-ware", "krnl", "scriptware", "comet", "valyse", "fluxus", "electron", "hydrogen"},
+	-- The per-experience game scripts, the neon module and the sense ESP library were all
+	-- removed: their URLs pointed at a branch that no longer exists and at the retired
+	-- shlexware org, so every fetch 404'd. Experience Sync went with them.
+	executors = {"synapse x", "script-ware", "krnl", "scriptware", "comet", "valyse", "fluxus", "electron", "hydrogen", "wave", "solara", "xeno", "swift", "delta", "codex", "arceus x", "trigon", "vegax", "cryptic"},
 	disconnectTypes = { {"ban", {"ban", "perm"}}, {"network", {"internet connection", "network"}} },
 	nameGeneration = {
 		adjectives = {"Cool", "Awesome", "Epic", "Ninja", "Super", "Mystic", "Swift", "Golden", "Diamond", "Silver", "Mint", "Roblox", "Amazing"},
@@ -343,7 +428,7 @@ local siriusValues = {
 			callback = function(value)
 				local character = localPlayer.Character
 				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-				if character then
+				if humanoid then -- was `if character`, which let a Humanoid-less character through
 					humanoid.WalkSpeed = value
 				end
 			end,
@@ -358,7 +443,7 @@ local siriusValues = {
 			callback = function(value)
 				local character = localPlayer.Character
 				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-				if character then
+				if humanoid then -- was `if character`, which let a Humanoid-less character through
 					if humanoid.UseJumpPower then
 						humanoid.JumpPower = value
 					else
@@ -374,7 +459,7 @@ local siriusValues = {
 			default = 3,
 			value = 3,
 			active = false,
-			callback = function(value) end,
+			callback = function() end, -- read directly by the Heartbeat flight loop
 		},
 		{
 			name = "field of view",
@@ -407,7 +492,7 @@ local siriusSettings = {
 			},
 			{
 				name = 'Chat Spy',
-				description = 'This will only work on the legacy Roblox chat system. Sirius will display whispers usually hidden from you in the chat box.',
+				description = 'Display whispers usually hidden from you in the chat box. This requires the legacy Roblox chat system; experiences on TextChatService route whispers through channels the client never receives, so Sirius will tell you when it is unavailable rather than silently doing nothing.',
 				settingType = 'Boolean',
 				current = true,
 
@@ -498,6 +583,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'noclip',
+				actionIndex = 1,
 				callback = function()
 					local noclip = siriusValues.actions[1]
 					noclip.enabled = not noclip.enabled
@@ -509,6 +595,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'flight',
+				actionIndex = 2,
 				callback = function()
 					local flight = siriusValues.actions[2]
 					flight.enabled = not flight.enabled
@@ -520,6 +607,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'refresh',
+				actionIndex = 3,
 				callback = function()
 					local refresh = siriusValues.actions[3]
 					if not refresh.enabled then
@@ -533,6 +621,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'respawn',
+				actionIndex = 4,
 				callback = function()
 					local respawn = siriusValues.actions[4]
 					if not respawn.enabled then
@@ -546,6 +635,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'invulnerability',
+				actionIndex = 5,
 				callback = function()
 					local invulnerability = siriusValues.actions[5]
 					invulnerability.enabled = not invulnerability.enabled
@@ -557,6 +647,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'fling',
+				actionIndex = 6,
 				callback = function()
 					local fling = siriusValues.actions[6]
 					fling.enabled = not fling.enabled
@@ -568,6 +659,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'esp',
+				actionIndex = 7,
 				callback = function()
 					local esp = siriusValues.actions[7]
 					esp.enabled = not esp.enabled
@@ -579,6 +671,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'nightandday',
+				actionIndex = 8,
 				callback = function()
 					local nightandday = siriusValues.actions[8]
 					nightandday.enabled = not nightandday.enabled
@@ -590,6 +683,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'globalaudio',
+				actionIndex = 9,
 				callback = function()
 					local globalaudio = siriusValues.actions[9]
 					globalaudio.enabled = not globalaudio.enabled
@@ -601,6 +695,7 @@ local siriusSettings = {
 				settingType = 'Key',
 				current = nil,
 				id = 'visibility',
+				actionIndex = 10,
 				callback = function()
 					local visibility = siriusValues.actions[10]
 					visibility.enabled = not visibility.enabled
@@ -753,13 +848,26 @@ local randomNumber = math.random(100, 3999) -- You can customize the range
 local randomUsername = randomAdjective .. randomNoun .. randomNumber
 
 -- Initialise Sirius Client Interface
-local guiParent = gethui and gethui() or coreGui
+local guiParent = getHiddenUI and getHiddenUI() or (useStudio and localPlayer:WaitForChild("PlayerGui")) or coreGui
 local sirius = guiParent:FindFirstChild("Sirius")
 if sirius then
 	sirius:Destroy()
 end
 
-local UI = game:GetObjects('rbxassetid://'..siriusValues.interfaceAsset)[1]
+-- In Studio there's no GetObjects, so the interface is expected to sit next to this script.
+local uiSuccess, uiResult = pcall(function()
+	if useStudio then
+		return script.Parent:FindFirstChild(siriusValues.siriusName)
+	end
+	return game:GetObjects('rbxassetid://'..siriusValues.interfaceAsset)[1]
+end)
+
+if not uiSuccess or not uiResult then
+	warn("Sirius | Unable to load the interface asset: " .. tostring(uiResult))
+	return
+end
+
+local UI = uiResult
 UI.Name = siriusValues.siriusName
 UI.Parent = guiParent
 UI.Enabled = false
@@ -780,301 +888,97 @@ local scriptsPanel = UI.Scripts
 local settingsPanel = UI.Settings
 local smartBar = UI.SmartBar
 local toggle = UI.Toggle
-local starlight = UI.Starlight
 local toastsContainer = UI.Toasts
 
 -- Interface Caching
-if not getgenv().cachedInGameUI then getgenv().cachedInGameUI = {} end
-if not getgenv().cachedCoreUI then getgenv().cachedCoreUI = {} end
+-- Reset per run: carrying a previous session's list over means closing Home re-enables
+-- interfaces the current experience never had open.
+env.cachedInGameUI = {}
+env.cachedCoreUI = {}
 
 -- Malicious Behavior Prevention
+--
+-- Both interception hooks replace a global, so a second execution would otherwise wrap
+-- Sirius' own wrapper and show one prompt per run. The pristine functions are stashed under
+-- a sentinel on first run and re-read on every run after that, so re-executing is idempotent.
 local indexSetClipboard = "setclipboard"
-local originalSetClipboard = getgenv()[indexSetClipboard]
 
-local index = http_request and "http_request" or "request"
-local originalRequest = getgenv()[index]
+-- Widened to match Rayfield: several executors only expose their request function under a
+-- namespace, and the old two-entry check left originalRequest nil on those.
+local index = (http_request and "http_request") or "request"
+local rawRequest = env.request
+	or env.http_request
+	or (env.http and env.http.request)
+	or (env.syn and env.syn.request)
+	or (env.fluxus and env.fluxus.request)
+
+if env.siriusOriginals == nil then
+	env.siriusOriginals = {
+		request = rawRequest,
+		setclipboard = env[indexSetClipboard],
+	}
+end
+
+local originalRequest = env.siriusOriginals.request
+local originalSetClipboard = env.siriusOriginals.setclipboard
 
 -- put this into siriusValues, like the fps and ping shit
 local suppressedSounds = {}
 local soundSuppressionNotificationCooldown = 0
 local soundInstances = {}
+local trackedSounds = {} -- [Sound] = true, replaces the linear table.find scan
+local trackedText = {} -- [TextLabel|TextButton] = true
 local cachedIds = {}
 local cachedText = {}
 
-if not getMessage then siriusValues.chatSpy.enabled = false end
+if not legacyChatActive then siriusValues.chatSpy.enabled = false end
 
 -- Call External Modules
 
 -- httpRequest
 local httpRequest = originalRequest
 
--- Neon Module
---local neonModule = (function() -- Open sourced neon module
---	local module = {}
---	do
---		local function IsNotNaN(x)
---			return x == x
---		end
---		local continued = IsNotNaN(camera:ScreenPointToRay(0,0).Origin.x)
---		while not continued do
---			runService.RenderStepped:wait()
---			continued = IsNotNaN(camera:ScreenPointToRay(0,0).Origin.x)
---		end
---	end
-
---	local RootParent = camera
---	local root
---	local binds = {}
-
---	local function getRoot()
---		if root then 
---			return root
---		else
---			root = Instance.new('Folder', RootParent)
---			root.Name = 'neon'
---			return root
---		end
---	end
-
---	local function destroyRoot()
---		if root then 
---			root:Destroy()
---			root = nil
---		end
---	end
-
---	local GenUid; do
---		local id = 0
---		function GenUid()
---			id = id + 1
---			return 'neon::'..tostring(id)
---		end
---	end
-
---	local DrawQuad; do
---		local acos, max, pi, sqrt = math.acos, math.max, math.pi, math.sqrt
---		local sz = 0.2
-
---		local function DrawTriangle(v1, v2, v3, p0, p1)
---			local s1 = (v1 - v2).magnitude
---			local s2 = (v2 - v3).magnitude
---			local s3 = (v3 - v1).magnitude
---			local smax = max(s1, s2, s3)
---			local A, B, C
---			if s1 == smax then
---				A, B, C = v1, v2, v3
---			elseif s2 == smax then
---				A, B, C = v2, v3, v1
---			elseif s3 == smax then
---				A, B, C = v3, v1, v2
---			end
-
---			local para = ( (B-A).x*(C-A).x + (B-A).y*(C-A).y + (B-A).z*(C-A).z ) / (A-B).magnitude
---			local perp = sqrt((C-A).magnitude^2 - para*para)
---			local dif_para = (A - B).magnitude - para
-
---			local st = CFrame.new(B, A)
---			local za = CFrame.Angles(pi/2,0,0)
-
---			local cf0 = st
-
---			local Top_Look = (cf0 * za).lookVector
---			local Mid_Point = A + CFrame.new(A, B).LookVector * para
---			local Needed_Look = CFrame.new(Mid_Point, C).LookVector
---			local dot = Top_Look.x*Needed_Look.x + Top_Look.y*Needed_Look.y + Top_Look.z*Needed_Look.z
-
---			local ac = CFrame.Angles(0, 0, acos(dot))
-
---			cf0 = cf0 * ac
---			if ((cf0 * za).lookVector - Needed_Look).magnitude > 0.01 then
---				cf0 = cf0 * CFrame.Angles(0, 0, -2*acos(dot))
---			end
---			cf0 = cf0 * CFrame.new(0, perp/2, -(dif_para + para/2))
-
---			local cf1 = st * ac * CFrame.Angles(0, pi, 0)
---			if ((cf1 * za).lookVector - Needed_Look).magnitude > 0.01 then
---				cf1 = cf1 * CFrame.Angles(0, 0, 2*acos(dot))
---			end
---			cf1 = cf1 * CFrame.new(0, perp/2, dif_para/2)
-
---			if not p0 then
---				p0 = Instance.new('Part')
---				p0.FormFactor = 'Custom'
---				p0.TopSurface = 0
---				p0.BottomSurface = 0
---				p0.Anchored = true
---				p0.CanCollide = false
---				p0.Material = 'Glass'
---				p0.Size = Vector3.new(sz, sz, sz)
---				local mesh = Instance.new('SpecialMesh', p0)
---				mesh.MeshType = 2
---				mesh.Name = 'WedgeMesh'
---			end
---			p0.WedgeMesh.Scale = Vector3.new(0, perp/sz, para/sz)
---			p0.CFrame = cf0
-
---			if not p1 then
---				p1 = p0:clone()
---			end
---			p1.WedgeMesh.Scale = Vector3.new(0, perp/sz, dif_para/sz)
---			p1.CFrame = cf1
-
---			return p0, p1
---		end
-
---		function DrawQuad(v1, v2, v3, v4, parts)
---			parts[1], parts[2] = DrawTriangle(v1, v2, v3, parts[1], parts[2])
---			parts[3], parts[4] = DrawTriangle(v3, v2, v4, parts[3], parts[4])
---		end
---	end
-
---	function module:BindFrame(frame, properties)
---		if binds[frame] then
---			return binds[frame].parts
---		end
-
---		local uid = GenUid()
---		local parts = {}
---		local f = Instance.new('Folder', getRoot())
---		f.Name = frame.Name
-
---		local parents = {}
---		do
---			local function add(child)
---				if child:IsA'GuiObject' then
---					parents[#parents + 1] = child
---					add(child.Parent)
---				end
---			end
---			add(frame)
---		end
-
---		local function UpdateOrientation(fetchProps)
---			local zIndex = 1 - 0.05*frame.ZIndex
---			local tl, br = frame.AbsolutePosition, frame.AbsolutePosition + frame.AbsoluteSize
---			local tr, bl = Vector2.new(br.x, tl.y), Vector2.new(tl.x, br.y)
---			do
---				local rot = 0
---				for _, v in ipairs(parents) do
---					rot = rot + v.Rotation
---				end
---				if rot ~= 0 and rot%180 ~= 0 then
---					local mid = tl:lerp(br, 0.5)
---					local s, c = math.sin(math.rad(rot)), math.cos(math.rad(rot))
---					local vec = tl
---					tl = Vector2.new(c*(tl.x - mid.x) - s*(tl.y - mid.y), s*(tl.x - mid.x) + c*(tl.y - mid.y)) + mid
---					tr = Vector2.new(c*(tr.x - mid.x) - s*(tr.y - mid.y), s*(tr.x - mid.x) + c*(tr.y - mid.y)) + mid
---					bl = Vector2.new(c*(bl.x - mid.x) - s*(bl.y - mid.y), s*(bl.x - mid.x) + c*(bl.y - mid.y)) + mid
---					br = Vector2.new(c*(br.x - mid.x) - s*(br.y - mid.y), s*(br.x - mid.x) + c*(br.y - mid.y)) + mid
---				end
---			end
---			DrawQuad(
---				camera:ScreenPointToRay(tl.x, tl.y, zIndex).Origin, 
---				camera:ScreenPointToRay(tr.x, tr.y, zIndex).Origin, 
---				camera:ScreenPointToRay(bl.x, bl.y, zIndex).Origin, 
---				camera:ScreenPointToRay(br.x, br.y, zIndex).Origin, 
---				parts
---			)
---			if fetchProps then
---				for _, pt in pairs(parts) do
---					pt.Parent = f
---				end
---				for propName, propValue in pairs(properties) do
---					for _, pt in pairs(parts) do
---						pt[propName] = propValue
---					end
---				end
---			end
---		end
-
---		UpdateOrientation(true)
---		runService:BindToRenderStep(uid, 2000, UpdateOrientation)
-
---		binds[frame] = {
---			uid = uid,
---			parts = parts
---		}
---		return binds[frame].parts
---	end
-
---	function module:Modify(frame, properties)
---		local parts = module:GetBoundParts(frame)
---		if parts then
---			for propName, propValue in pairs(properties) do
---				for _, pt in pairs(parts) do
---					pt[propName] = propValue
---				end
---			end
---		end
---	end
-
---	function module:UnbindFrame(frame)
---		if RootParent == nil then return end
---		local cb = binds[frame]
---		if cb then
---			runService:UnbindFromRenderStep(cb.uid)
---			for _, v in pairs(cb.parts) do
---				v:Destroy()
---			end
---			binds[frame] = nil
---		end
---		if getRoot():FindFirstChild(frame.Name) then
---			getRoot()[frame.Name]:Destroy()
---		end
---	end
-
---	function module:HasBinding(frame)
---		return binds[frame] ~= nil
---	end
-
---	function module:GetBoundParts(frame)
---		return binds[frame] and binds[frame].parts
---	end
-
-
---	return module
-
---end)()
-
 -- Sirius Functions
 local function checkSirius() return UI.Parent end
-local function getPing() return math.clamp(statsService.Network.ServerStatsItem["Data Ping"]:GetValue(), 10, 700) end
-local function checkFolder() if isfolder then if not isfolder(siriusValues.siriusFolder) then makefolder(siriusValues.siriusFolder) end if not isfolder(siriusValues.siriusFolder.."/Music") then makefolder(siriusValues.siriusFolder.."/Music") writefile(siriusValues.siriusFolder.."/Music/readme.txt", "Hey there! Place your MP3 or other audio files in this folder, and have the ability to play them through the Sirius Music UI!") end if not isfolder(siriusValues.siriusFolder.."/Assets/Icons") then makefolder(siriusValues.siriusFolder.."/Assets/Icons") end if not isfolder(siriusValues.siriusFolder.."/Assets") then makefolder(siriusValues.siriusFolder.."/Assets") end end end
-local function isPanel(name) return not table.find({"Home", "Music", "Settings"}, name) end
 
-local function fetchFromCDN(path, write, savePath)
-	pcall(function()
-		checkFolder()
-
-		local file = game:HttpGet(siriusValues.cdn..path) or nil
-		if not file then return end
-		if not write then return file end
-
-
-		writefile(siriusValues.siriusFolder.."/"..savePath, file)
-
-		return
+local function getPing()
+	local success, ping = pcall(function()
+		return statsService.Network.ServerStatsItem["Data Ping"]:GetValue()
 	end)
+	return success and math.clamp(ping, 10, 700) or 0
 end
 
-local function fetchIcon(iconName)
-	pcall(function()
-		checkFolder()
+-- Parents are created before their children; the old ordering made Assets/Icons first, which
+-- failed on executors that don't create intermediate directories and then skipped Assets
+-- entirely on the ones that do.
+local function checkFolder()
+	if not (isfolder and makefolder) then return end
 
-		local pathCDN = siriusValues.icons..iconName..".png"
-		local path = siriusValues.siriusFolder.."/Assets/"..iconName..".png"
+	local root = siriusValues.siriusFolder
+	for _, path in ipairs({root, root.."/Music", root.."/Assets", root.."/Assets/Icons"}) do
+		if not isfolder(path) then makefolder(path) end
+	end
 
-		if not isfile(path) then
-			local file = game:HttpGet(pathCDN)
-			if not file then return end
+	if writefile and isfile and not isfile(root.."/Music/readme.txt") then
+		writefile(root.."/Music/readme.txt", "Hey there! Place your MP3 or other audio files in this folder, and have the ability to play them through the Sirius Music UI!")
+	end
+end
 
-			writefile(path, file)
-		end
+local function isPanel(name) return not table.find({"Home", "Music", "Settings"}, name) end
 
-		local imageToReturn = getcustomasset(path)
+-- Both fetchers used to `return` from inside their pcall closure, so the value never left the
+-- function and every caller saw nil.
+local function fetchFromCDN(path, write, savePath)
+	local success, file = pcall(game.HttpGet, game, siriusValues.cdn..path)
+	if not success or not file or #file == 0 then return nil end
 
-		return imageToReturn
-	end)
+	if not write then return file end
+	if not writefile then return file end
+
+	checkFolder()
+	pcall(writefile, siriusValues.siriusFolder.."/"..savePath, file)
+
+	return file
 end
 
 local function storeOriginalText(element)
@@ -1159,38 +1063,20 @@ local function makeDraggable(object)
 	end)
 end
 
-local function checkAction(target)
-	local toReturn = {}
-
-	for _, action in ipairs(siriusValues.actions) do
-		if action.name == target then
-			toReturn.action = action
-			break
-		end
-	end
-
-	for _, action in ipairs(characterPanel.Interactions.Grid:GetChildren()) do
-		if action.name == target then
-			toReturn.object = action
-			break
-		end
-	end
-
-	return toReturn
+-- Looks up the grid button for an action. The old checkAction matched the *setting* name against
+-- the *action* name and always returned a table even on a miss, so callers' `if action then`
+-- guard never fired. Two names never matched ('NoClip' vs 'Noclip', 'ESP' vs 'Extrasensory
+-- Perception'), which meant those keybinds threw on every press.
+local function actionButton(action)
+	if not action then return nil end
+	return characterPanel.Interactions.Grid:FindFirstChild(action.name)
 end
 
+-- The category-scoped form used to `return` after examining the first category regardless of
+-- whether it matched, so scoped lookups only worked when the target happened to be first.
 local function checkSetting(settingTarget, categoryTarget)
 	for _, category in ipairs(siriusSettings) do
-		if categoryTarget then
-			if category.name == categoryTarget then
-				for _, setting in ipairs(category.categorySettings) do
-					if setting.name == settingTarget then
-						return setting
-					end
-				end
-			end
-			return
-		else
+		if not categoryTarget or category.name == categoryTarget then
 			for _, setting in ipairs(category.categorySettings) do
 				if setting.name == settingTarget then
 					return setting
@@ -1198,13 +1084,24 @@ local function checkSetting(settingTarget, categoryTarget)
 			end
 		end
 	end
+
+	return nil
+end
+
+-- Every checkSetting caller immediately reads .current, so a typo'd or removed name used to
+-- throw at the call site. Callers get a stable default instead.
+local function settingValue(settingTarget, fallback)
+	local setting = checkSetting(settingTarget)
+	if setting == nil or setting.current == nil then return fallback end
+	return setting.current
 end
 
 local function wipeTransparency(ins, target, checkSelf, tween, duration)
 	local transparencyProperties = siriusValues.transparencyProperties
 
 	local function applyTransparency(obj)
-		local properties = transparencyProperties[obj.className]
+		-- ClassName / GetDescendants; the lowercase aliases are deprecated legacy spellings
+		local properties = transparencyProperties[obj.ClassName]
 
 		if properties then
 			local tweenProperties = {}
@@ -1228,7 +1125,7 @@ local function wipeTransparency(ins, target, checkSelf, tween, duration)
 		applyTransparency(ins)
 	end
 
-	for _, descendant in ipairs(ins:getDescendants()) do
+	for _, descendant in ipairs(ins:GetDescendants()) do
 		applyTransparency(descendant)
 	end
 end
@@ -1278,8 +1175,6 @@ local function figureNotifications()
 	end
 end
 
-local contentProvider = game:GetService("ContentProvider")
-
 local function queueNotification(Title, Description, Image)
 	task.spawn(function()		
 		if checkSirius() then
@@ -1317,7 +1212,7 @@ local function queueNotification(Title, Description, Image)
 			if not tonumber(Image) then
 				newNotification.Icon.Image = 'rbxassetid://14317577326'
 			else
-				newNotification.Icon.Image = 'rbxassetid://'..Image or 0
+				newNotification.Icon.Image = 'rbxassetid://'..tostring(Image)
 			end
 
 			newNotification:TweenPosition(UDim2.new(0.5, 0, 0, newNotification.Size.Y.Offset + 2), "Out", "Quint", 0.9, true)
@@ -1333,11 +1228,6 @@ local function queueNotification(Title, Description, Image)
 			task.wait(0.04)
 			tweenService:Create(newNotification.Description, TweenInfo.new(0.5, Enum.EasingStyle.Exponential), {TextTransparency = 0.15}):Play()
 			tweenService:Create(newNotification.Time, TweenInfo.new(0.5, Enum.EasingStyle.Exponential), {TextTransparency = 0.5}):Play()
-
-			--neonModule:BindFrame(newNotification.BlurModule, {
-			--	Transparency = 0.98,
-			--	BrickColor = BrickColor.new("Institutional white")
-			--})
 
 			newNotification.Interact.MouseButton1Click:Connect(function()
 				local foundNotification = table.find(notifications, newNotification)
@@ -1362,7 +1252,6 @@ local function queueNotification(Title, Description, Image)
 			tweenService:Create(newNotification, TweenInfo.new(0.8, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {Position = UDim2.new(1.5, 0, 0, newNotification.Position.Y.Offset)}):Play()
 
 			task.wait(1.2)
-			--neonModule:UnbindFrame(newNotification.BlurModule)
 			newNotification:Destroy()
 			figureNotifications()
 		end
@@ -1384,7 +1273,7 @@ end
 local function removeReverbs(timing)
 	timing = timing or 0.65
 
-	for index, sound in next, soundInstances do
+	for _, sound in ipairs(soundInstances) do
 		if sound:FindFirstChild("SiriusAudioProfile") then
 			local reverb = sound:FindFirstChild("SiriusAudioProfile")
 			tweenService:Create(reverb, TweenInfo.new(timing, Enum.EasingStyle.Exponential), {HighGain = 0}):Play()
@@ -1396,47 +1285,57 @@ local function removeReverbs(timing)
 	end
 end
 
+-- Iterative rather than recursive: the old version called itself once per track, and because
+-- that call wasn't in tail position the stack grew for the whole length of the queue.
 local function playNext()
 	playGeneration += 1
 	local thisGen = playGeneration
 
-	if #musicQueue == 0 then
-		if currentAudio then currentAudio.Playing = false currentAudio.SoundId = "" end
-		musicPanel.Playing.Text = "Not Playing"
-		return
+	while true do
+		if #musicQueue == 0 then
+			if currentAudio then currentAudio.Playing = false currentAudio.SoundId = "" end
+			musicPanel.Playing.Text = "Not Playing"
+			return
+		end
+
+		if not currentAudio then
+			local newAudio = Instance.new("Sound")
+			newAudio.Parent = UI
+			newAudio.Name = "Audio"
+			currentAudio = newAudio
+		end
+
+		local entry = musicQueue[1]
+		local assetSuccess, asset = pcall(getCustomAsset, siriusValues.siriusFolder.."/Music/"..entry.sound)
+
+		if musicPanel.Queue.List:FindFirstChild(tostring(entry.instanceName)) then
+			musicPanel.Queue.List:FindFirstChild(tostring(entry.instanceName)):Destroy()
+		end
+
+		if not assetSuccess or not asset then
+			-- Unreadable file: drop it and move on instead of stalling the whole queue
+			queueNotification("Unable to play file", entry.sound.." could not be loaded and has been skipped.", 4370341699)
+			table.remove(musicQueue, 1)
+			continue
+		end
+
+		if settingValue("Now Playing Notifications") then queueNotification("Now Playing", entry.sound, 4400695581) end
+
+		currentAudio.SoundId = asset
+		musicPanel.Playing.Text = entry.sound
+		currentAudio:Play()
+		musicPanel.Menu.TogglePlaying.ImageRectOffset = currentAudio.Playing and Vector2.new(804, 124) or Vector2.new(764, 244)
+		currentAudio.Ended:Wait()
+
+		if thisGen ~= playGeneration then return end -- superseded by Next/skip; let the active call do the table.remove
+
+		table.remove(musicQueue, 1)
 	end
-
-	if not currentAudio then
-		local newAudio = Instance.new("Sound")
-		newAudio.Parent = UI
-		newAudio.Name = "Audio"
-		currentAudio = newAudio
-	end
-
-	musicPanel.Menu.TogglePlaying.ImageRectOffset = currentAudio.Playing and Vector2.new(804, 124) or Vector2.new(764, 244)
-	local asset = getcustomasset(siriusValues.siriusFolder.."/Music/"..musicQueue[1].sound)
-
-	if checkSetting("Now Playing Notifications").current then queueNotification("Now Playing", musicQueue[1].sound, 4400695581) end
-
-	if musicPanel.Queue.List:FindFirstChild(tostring(musicQueue[1].instanceName)) then
-		musicPanel.Queue.List:FindFirstChild(tostring(musicQueue[1].instanceName)):Destroy()
-	end
-
-	currentAudio.SoundId = asset
-	musicPanel.Playing.Text = musicQueue[1].sound
-	currentAudio:Play()
-	musicPanel.Menu.TogglePlaying.ImageRectOffset = currentAudio.Playing and Vector2.new(804, 124) or Vector2.new(764, 244)
-	currentAudio.Ended:Wait()
-
-	if thisGen ~= playGeneration then return end -- superseded by Next/skip; let the active call do the table.remove
-
-	table.remove(musicQueue, 1)
-
-	playNext()
 end
 
 local function addToQueue(file)
-	if not getcustomasset then return end
+	if not (getCustomAsset and isfile) then return end
+	if not file or file == "" then return end
 	checkFolder()
 	if not isfile(siriusValues.siriusFolder.."/Music/"..file) then queueNotification("Unable to locate file", "Please ensure that your audio file is in the Sirius/Music folder and that you are including the file extension (e.g mp3 or ogg).", 4370341699) return end
 	musicPanel.AddBox.Input.Text = ""
@@ -1446,8 +1345,10 @@ local function addToQueue(file)
 	newAudio.Size = UDim2.new(0, 254, 0, 40)
 	newAudio.Close.ImageTransparency = 1
 	newAudio.Name = file
-	if string.len(newAudio.FileName.Text) > 26 then
-		newAudio.FileName.Text = string.sub(tostring(file), 1,24)..".."
+	-- Measured against the filename, not the cloned template's placeholder text, which is what
+	-- the old check read - so truncation fired off a constant instead of the actual length.
+	if string.len(file) > 26 then
+		newAudio.FileName.Text = string.sub(file, 1, 24)..".."
 	else
 		newAudio.FileName.Text = file
 	end
@@ -1456,14 +1357,20 @@ local function addToQueue(file)
 
 	table.insert(musicQueue, {sound = file, instanceName = newAudio.Name})
 
-	local getLength = Instance.new("Sound", workspace)
-	getLength.SoundId = getcustomasset(siriusValues.siriusFolder.."/Music/"..file)
-	getLength.Volume = 0
-	getLength:Play()
-	task.wait(0.05)
-	newAudio.Duration.Text = tostring(math.round(getLength.TimeLength)).."s"
-	getLength:Stop()
-	getLength:Destroy()
+	local lengthSuccess, lengthAsset = pcall(getCustomAsset, siriusValues.siriusFolder.."/Music/"..file)
+	if lengthSuccess and lengthAsset then
+		local getLength = Instance.new("Sound")
+		getLength.Parent = workspace
+		getLength.SoundId = lengthAsset
+		getLength.Volume = 0
+		getLength:Play()
+		task.wait(0.05)
+		if newAudio.Parent then
+			newAudio.Duration.Text = tostring(math.round(getLength.TimeLength)).."s"
+		end
+		getLength:Stop()
+		getLength:Destroy()
+	end
 
 	newAudio.MouseEnter:Connect(function()
 		tweenService:Create(newAudio, TweenInfo.new(0.45, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(100, 100, 100)}):Play()
@@ -1478,25 +1385,30 @@ local function addToQueue(file)
 	end)
 
 	newAudio.Close.MouseButton1Click:Connect(function()
-		if not currentAudio or not string.find(currentAudio.Name, file) then
-			for i,v in pairs(musicQueue) do
-				for _,b in pairs(v) do
-					if b == newAudio.Name then
-						newAudio:Destroy()
-						table.remove(musicQueue, i)
-					end
-				end
+		-- The old version looped over every field of each queue entry. `sound` and `instanceName`
+		-- hold the same filename, so each match fired twice and removed two entries - silently
+		-- dropping the following track. One indexed pass, matched on one field, with a break.
+		local removedIndex
+		for i = 1, #musicQueue do
+			if musicQueue[i].instanceName == newAudio.Name then
+				removedIndex = i
+				break
 			end
-		else
-			for i,v in pairs(musicQueue) do
-				for _,b in pairs(v) do
-					if b == newAudio.Name then
-						newAudio:Destroy()
-						table.remove(musicQueue, i)
-						playNext()
-					end
-				end
-			end
+		end
+
+		if not removedIndex then
+			newAudio:Destroy()
+			return
+		end
+
+		local wasPlaying = removedIndex == 1 and currentAudio ~= nil and currentAudio.Playing
+
+		table.remove(musicQueue, removedIndex)
+		newAudio:Destroy()
+
+		-- Only restart playback when the track we removed is the one currently playing
+		if wasPlaying then
+			task.spawn(playNext)
 		end
 	end)
 
@@ -1521,7 +1433,7 @@ local function closeMusic()
 end
 
 local function createReverb(timing)
-	for index, sound in next, soundInstances do
+	for _, sound in ipairs(soundInstances) do
 		if not sound:FindFirstChild("SiriusAudioProfile") then
 			local reverb = Instance.new("EqualizerSoundEffect")
 
@@ -1544,135 +1456,40 @@ local function createReverb(timing)
 	end
 end
 
-local function runScript(raw)
-	loadstring(game:HttpGet(raw))()
-end
+-- Experience Sync (the per-experience game scripts) was removed: siriusValues.rawTree pointed
+-- at a branch of this repo that no longer exists, so every fetch 404'd. The creator identity it
+-- populated is now resolved directly, because Moderator Detection reads it and previously never
+-- saw it set - Experience Sync was disabled, so the detection could never fire.
+siriusValues.currentCreator = creatorType == Enum.CreatorType.Group and "group" or creatorId
+siriusValues.currentGroup = creatorType == Enum.CreatorType.Group and creatorId or nil
 
-local function syncExperienceInformation()
-	siriusValues.currentCreator = creatorId
-
-	if creatorType == Enum.CreatorType.Group then
-		siriusValues.currentGroup = creatorId
-		siriusValues.currentCreator = "group"
-	end
-
-	for _, gameFound in pairs(siriusValues.games) do
-		if gameFound.id == placeId and gameFound.enabled then
-
-			local minimumTier = gameFound.minimumTier
-
-			if minimumTier == "Essential" then
-				if not (Essential or Pro) then
-					return
-				end
-			elseif minimumTier == "Pro" then
-				if not Pro then
-					return
-				end
-			end
-
-			local rawFile = siriusValues.rawTree..gameFound.raw
-			siriusValues.currentGame = gameFound
-
-			gameDetectionPrompt.ScriptTitle.Text = gameFound.name
-			gameDetectionPrompt.Layer.ScriptSubtitle.Text = gameFound.description
-			gameDetectionPrompt.Thumbnail.Image = "https://assetgame.roblox.com/Game/Tools/ThumbnailAsset.ashx?aid="..tostring(placeId).."&fmt=png&wd=420&ht=420"
-
-			gameDetectionPrompt.Size = UDim2.new(0, 550, 0, 0)
-			gameDetectionPrompt.Position = UDim2.new(0.5, 0, 0, 120)
-			gameDetectionPrompt.UICorner.CornerRadius = UDim.new(0, 9)
-			gameDetectionPrompt.Thumbnail.UICorner.CornerRadius = UDim.new(0, 9)
-			gameDetectionPrompt.ScriptTitle.Position = UDim2.new(0, 30, 0.5, 0)
-			gameDetectionPrompt.Layer.Visible = false
-			gameDetectionPrompt.Warning.Visible = false
-
-			wipeTransparency(gameDetectionPrompt, 1, true)
-
-			gameDetectionPrompt.Visible = true
-
-			tweenService:Create(gameDetectionPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint),  {BackgroundTransparency = 0}):Play()
-			tweenService:Create(gameDetectionPrompt.Thumbnail, TweenInfo.new(0.5, Enum.EasingStyle.Quint),  {ImageTransparency = 0.4}):Play()
-			tweenService:Create(gameDetectionPrompt.ScriptTitle, TweenInfo.new(0.6, Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
-
-			tweenService:Create(gameDetectionPrompt, TweenInfo.new(0.7, Enum.EasingStyle.Quint), {Size = UDim2.new(0, 587, 0, 44)}):Play()
-			tweenService:Create(gameDetectionPrompt, TweenInfo.new(1, Enum.EasingStyle.Exponential), {Position = UDim2.new(0.5, 0, 0, 150)}):Play()
-
-			task.wait(1)
-
-			wipeTransparency(gameDetectionPrompt.Layer, 1, true)
-
-			gameDetectionPrompt.Layer.Visible = true
-
-			tweenService:Create(gameDetectionPrompt, TweenInfo.new(0.7, Enum.EasingStyle.Quint), {Size = UDim2.new(0, 473, 0, 154)}):Play()
-			tweenService:Create(gameDetectionPrompt.ScriptTitle, TweenInfo.new(1, Enum.EasingStyle.Exponential), {Position = UDim2.new(0, 23, 0.352, 0)}):Play()
-			tweenService:Create(gameDetectionPrompt, TweenInfo.new(1, Enum.EasingStyle.Exponential), {Position = UDim2.new(0.5, 0, 0, 200)}):Play()
-			tweenService:Create(gameDetectionPrompt.UICorner, TweenInfo.new(1, Enum.EasingStyle.Exponential), {CornerRadius = UDim.new(0, 13)}):Play()
-			tweenService:Create(gameDetectionPrompt.Thumbnail.UICorner, TweenInfo.new(1, Enum.EasingStyle.Exponential), {CornerRadius = UDim.new(0, 13)}):Play()
-			tweenService:Create(gameDetectionPrompt.Thumbnail, TweenInfo.new(1, Enum.EasingStyle.Exponential), {ImageTransparency = 0.5}):Play()
-
-			task.wait(0.3)
-			tweenService:Create(gameDetectionPrompt.Layer.ScriptSubtitle, TweenInfo.new(0.6, Enum.EasingStyle.Quint),  {TextTransparency = 0.3}):Play()
-			tweenService:Create(gameDetectionPrompt.Layer.Run, TweenInfo.new(0.6, Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
-			tweenService:Create(gameDetectionPrompt.Layer.Run.UIStroke, TweenInfo.new(0.6, Enum.EasingStyle.Quint),  {Transparency = 0.85}):Play()
-			tweenService:Create(gameDetectionPrompt.Layer.Run, TweenInfo.new(0.6, Enum.EasingStyle.Quint),  {BackgroundTransparency = 0.6}):Play()
-
-			task.wait(0.2)
-
-			tweenService:Create(gameDetectionPrompt.Layer.Close, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {ImageTransparency = 0.6}):Play()
-
-			task.wait(0.3)
-
-			local function closeGameDetection()
-				tweenService:Create(gameDetectionPrompt.Layer.ScriptSubtitle, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {TextTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.Layer.Run, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {TextTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.Layer.Run, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {BackgroundTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.Layer.Close, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {ImageTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.Thumbnail, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {ImageTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.ScriptTitle, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {TextTransparency = 1}):Play()
-				tweenService:Create(gameDetectionPrompt.Layer.Run.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quint),  {Transparency = 1}):Play()
-				task.wait(0.05)
-				tweenService:Create(gameDetectionPrompt, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Size = UDim2.new(0, 400, 0, 0)}):Play()
-				tweenService:Create(gameDetectionPrompt.UICorner, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {CornerRadius = UDim.new(0, 5)}):Play()
-				tweenService:Create(gameDetectionPrompt.Thumbnail.UICorner, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {CornerRadius = UDim.new(0, 5)}):Play()
-				task.wait(0.41)
-				gameDetectionPrompt.Visible = false
-			end
-
-			gameDetectionPrompt.Layer.Run.MouseButton1Click:Connect(function()
-				closeGameDetection()
-				queueNotification("Running "..gameFound.name, "Now running Sirius' "..gameFound.name.." script, this may take a moment.", 4400701828)
-				runScript(rawFile)
-
-			end)
-
-			gameDetectionPrompt.Layer.Close.MouseButton1Click:Connect(function()
-				closeGameDetection()
-			end)
-
-			break
+local function updateSliderPadding()
+	for _, v in pairs(siriusValues.sliders) do
+		-- Viewport changes can land before sortActions() has built the slider objects
+		if v.object then
+			v.padding = {
+				v.object.Interact.AbsolutePosition.X,
+				v.object.Interact.AbsolutePosition.X + v.object.Interact.AbsoluteSize.X
+			}
 		end
 	end
 end
 
-local function updateSliderPadding()
-	for _, v in pairs(siriusValues.sliders) do
-		v.padding = {
-			v.object.Interact.AbsolutePosition.X,
-			v.object.Interact.AbsolutePosition.X + v.object.Interact.AbsoluteSize.X
-		}
-	end
-end
-
 local function updateSlider(data, setValue, forceValue)
+	if not data.object or not data.padding then return end
+
 	local inverse_interpolation
 
 	if setValue then
 		setValue = math.clamp(setValue, data.values[1], data.values[2])
 		inverse_interpolation = (setValue - data.values[1]) / (data.values[2] - data.values[1])
-		local posX = data.padding[1] + (data.padding[2] - data.padding[1]) * inverse_interpolation
 	else
-		local posX = math.clamp(mouse.X, data.padding[1], data.padding[2])
-		inverse_interpolation = (posX - data.padding[1]) / (data.padding[2] - data.padding[1])
+		-- Player:GetMouse() is deprecated and reports nothing on touch devices, so the sliders
+		-- were desktop-only. UserInputService covers mouse, touch and pen with one call.
+		local pointerX = userInputService:GetMouseLocation().X
+		local posX = math.clamp(pointerX, data.padding[1], data.padding[2])
+		local span = data.padding[2] - data.padding[1]
+		inverse_interpolation = span > 0 and (posX - data.padding[1]) / span or 0
 	end
 
 	tweenService:Create(data.object.Progress, TweenInfo.new(.5, Enum.EasingStyle.Quint), {Size = UDim2.new(inverse_interpolation, 0, 1, 0)}):Play()
@@ -1681,7 +1498,9 @@ local function updateSlider(data, setValue, forceValue)
 	data.object.Information.Text = value.." "..data.name
 	data.value = value
 
-	if data.callback and not setValue or forceValue then
+	-- Parenthesised: this used to read (callback and not setValue) or forceValue, so a forced
+	-- update on a slider without a callback called nil.
+	if data.callback and (not setValue or forceValue) then
 		data.callback(value)
 	end
 end
@@ -1727,7 +1546,7 @@ local function sortActions()
 		end)
 
 		newAction.Interact.MouseButton1Click:Connect(function()
-			local success, response = pcall(function()
+			local success = pcall(function()
 				action.enabled = not action.enabled
 				action.callback(action.enabled)
 
@@ -1774,12 +1593,14 @@ local function sortActions()
 		end)
 	end
 
-	if localPlayer.Character then
-		if not localPlayer.Character:FindFirstChildOfClass('Humanoid').UseJumpPower then
-			siriusValues.sliders[2].name = "jump height"
-			siriusValues.sliders[2].default = 7.2
-			siriusValues.sliders[2].values = {0, 120}
-		end
+	-- The character can exist without a Humanoid mid-spawn; indexing straight through used to
+	-- throw here, which aborted start() and left the whole interface half-built.
+	local startingHumanoid = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass('Humanoid')
+	if startingHumanoid and not startingHumanoid.UseJumpPower then
+		siriusValues.sliders[2].name = "jump height"
+		siriusValues.sliders[2].default = 7.2
+		siriusValues.sliders[2].value = 7.2
+		siriusValues.sliders[2].values = {0, 120}
 	end
 
 
@@ -1881,23 +1702,25 @@ end
 
 local function checkTools()
 	task.wait(0.03)
-	if localPlayer.Backpack and localPlayer.Character then
-		if localPlayer.Backpack:FindFirstChildOfClass('Tool') or localPlayer.Character:FindFirstChildOfClass('Tool') then
-			return true
-		end
-	else
-		return false
-	end
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	local character = localPlayer.Character
+
+	-- Used to fall off the end returning nil when a backpack existed but held no tools
+	return (backpack and backpack:FindFirstChildOfClass('Tool') ~= nil)
+		or (character and character:FindFirstChildOfClass('Tool') ~= nil)
+		or false
 end
 
 local function closePanel(panelName, openingOther)
-	debounce = true
-
 	local button = smartBar.Buttons:FindFirstChild(panelName)
 	local panel = UI:FindFirstChild(panelName)
 
+	-- Guards run before debounce is claimed. Bailing out after setting it left the flag stuck
+	-- true, which locks every panel, Home, Settings, Music and ScriptSearch for the session.
 	if not isPanel(panelName) then return end
 	if not (panel and button) then return end
+
+	debounce = true
 
 	local panelSize = UDim2.new(0, 581, 0, 246)
 
@@ -1954,11 +1777,7 @@ local function closePanel(panelName, openingOther)
 				if playerIns.ClassName == "Frame" then
 					tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {BackgroundTransparency = 1}):Play()
 				elseif playerIns.ClassName == "TextLabel" or playerIns.ClassName == "TextButton" then
-					if playerIns.Name == "DisplayName" then
-						tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
-					else
-						tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
-					end
+					tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
 				elseif playerIns.ClassName == "ImageLabel" or playerIns.ClassName == "ImageButton" then
 					tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
 					if playerIns.Name == "Avatar" then tweenService:Create(playerIns, TweenInfo.new(0.15, Enum.EasingStyle.Quint), {BackgroundTransparency = 1}):Play() end
@@ -2002,13 +1821,14 @@ end
 
 local function openPanel(panelName)
 	if debounce then return end
-	debounce = true
-
 	local button = smartBar.Buttons:FindFirstChild(panelName)
 	local panel = UI:FindFirstChild(panelName)
 
+	-- Same as closePanel: never claim the debounce before the guards have passed
 	if not isPanel(panelName) then return end
 	if not (panel and button) then return end
+
+	debounce = true
 
 	for _, otherPanel in ipairs(UI:GetChildren()) do
 		if smartBar.Buttons:FindFirstChild(otherPanel.Name) then
@@ -2178,25 +1998,45 @@ end
 
 local function serverhop()
 	local highestPlayers = 0
-	local servers = {}
+	local target
 
-	for _, v in ipairs(httpService:JSONDecode(game:HttpGetAsync("https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100")).data) do
+	-- A rate-limited or offline games API used to throw straight out of the click handler
+	local success, response = pcall(function()
+		return httpService:JSONDecode(game:HttpGetAsync("https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
+	end)
+
+	if not success or not response or not response.data then
+		return queueNotification("Unable to find servers", "Sirius couldn't reach the Roblox server list, this is usually rate limiting. Try again in a moment.", 4370317928)
+	end
+
+	for _, v in ipairs(response.data) do
 		if type(v) == "table" and v.maxPlayers > v.playing and v.id ~= jobId then
 			if v.playing > highestPlayers then
 				highestPlayers = v.playing
-				servers[1] = v.id
+				target = v.id
 			end
 		end
 	end
 
-	if #servers > 0 then
-		queueNotification("Teleporting", "We're now moving you to the new session, this may take a few seconds.", 4335479121)
-		task.wait(0.3)
-		teleportService:TeleportToPlaceInstance(placeId, servers[1])
-	else
+	if not target then
 		return queueNotification("No Servers Found", "We couldn't find another server, this may be the only server.", 4370317928)
 	end
 
+	queueNotification("Teleporting", "We're now moving you to the new session, this may take a few seconds.", 4335479121)
+	task.wait(0.3)
+
+	local hopped = pcall(teleportService.TeleportToPlaceInstance, teleportService, placeId, target)
+	if not hopped then
+		queueNotification("Teleport Failed", "Roblox refused the teleport to that server. Try again in a moment.", 4370317928)
+	end
+end
+
+-- game:Shutdown() is a server method; client availability depends entirely on the executor and
+-- it was being called bare from two user-facing buttons. Fall back to the home page.
+local function leaveExperience()
+	if pcall(function() game:Shutdown() end) then return end
+	if pcall(teleportService.Teleport, teleportService, 0, localPlayer) then return end
+	queueNotification("Unable to leave", "Sirius couldn't close the experience from here, you'll need to leave manually.", 4370317928)
 end
 
 local function ensureFrameProperties()
@@ -2216,7 +2056,8 @@ local function ensureFrameProperties()
 	settingsPanel.Visible = false
 	smartBar.Visible = false
 	musicPanel.Playing.Text = "Not Playing"
-	if not getcustomasset then smartBar.Buttons.Music.Visible = false end
+	-- Music needs getcustomasset to load local files at all
+	if not getCustomAsset then smartBar.Buttons.Music.Visible = false end
 	toastsContainer.Visible = true
 	makeDraggable(settingsPanel)
 	makeDraggable(musicPanel)
@@ -2233,7 +2074,7 @@ local function checkFriends()
 		if success then
 			repeat
 				local info = page:GetCurrentPage()
-				for i, friendInfo in pairs(info) do
+				for _, friendInfo in pairs(info) do
 					table.insert(playersFriends, friendInfo)
 				end
 				if not page.IsFinished then 
@@ -2246,7 +2087,7 @@ local function checkFriends()
 		local onlineFriends = 0 
 		local friendsInGame = 0 
 
-		for i,v in pairs(playersFriends) do
+		for _, v in pairs(playersFriends) do
 			friendsInTotal  = friendsInTotal + 1
 
 			if v.IsOnline then
@@ -2270,10 +2111,34 @@ local function checkFriends()
 	end
 end
 
-function promptModerator(player, role)
-	local serversAvailable = false
-	local promptClosed = false
+-- Connected once at load. These used to be wired up inside promptModerator, so after N
+-- detections a single click on Leave fired N times.
+local closeModPrompt
 
+moderatorDetectionPrompt.Leave.MouseButton1Click:Connect(function()
+	if closeModPrompt then closeModPrompt() end
+	leaveExperience()
+end)
+
+moderatorDetectionPrompt.Serverhop.MouseEnter:Connect(function()
+	tweenService:Create(moderatorDetectionPrompt.ServersAvailableFade, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 0.5}):Play()
+end)
+
+moderatorDetectionPrompt.Serverhop.MouseLeave:Connect(function()
+	tweenService:Create(moderatorDetectionPrompt.ServersAvailableFade, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
+end)
+
+moderatorDetectionPrompt.Serverhop.MouseButton1Click:Connect(function()
+	if not moderatorDetectionPrompt.Visible then return end
+	task.spawn(serverhop)
+	if closeModPrompt then closeModPrompt() end
+end)
+
+moderatorDetectionPrompt.Close.MouseButton1Click:Connect(function()
+	if closeModPrompt then closeModPrompt() end
+end)
+
+local function promptModerator(player, role)
 	if moderatorDetectionPrompt.Visible then return end
 
 	moderatorDetectionPrompt.Size = UDim2.new(0, 283, 0, 175)
@@ -2286,17 +2151,31 @@ function promptModerator(player, role)
 
 	moderatorDetectionPrompt.Visible = true
 
-	for _, v in ipairs(game:GetService("HttpService"):JSONDecode(game:HttpGetAsync("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")).data) do
-		if type(v) == "table" and v.maxPlayers > v.playing and v.id ~= game.JobId then
-			serversAvailable = true
-		end
-	end
+	-- Assume a hop is possible and correct it once the server list lands. Blocking the prompt
+	-- on an unguarded HTTP call meant a rate-limited response threw and left it half-drawn.
+	moderatorDetectionPrompt.Serverhop.Visible = true
+	moderatorDetectionPrompt.ServersAvailableFade.Visible = true
 
-	if not serversAvailable then
-		moderatorDetectionPrompt.Serverhop.Visible = false
-	else
-		moderatorDetectionPrompt.ServersAvailableFade.Visible = true
-	end
+	task.spawn(function()
+		local serversAvailable = false
+		local success, response = pcall(function()
+			return httpService:JSONDecode(game:HttpGetAsync("https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"))
+		end)
+
+		if success and response and response.data then
+			for _, v in ipairs(response.data) do
+				if type(v) == "table" and v.maxPlayers > v.playing and v.id ~= jobId then
+					serversAvailable = true
+					break
+				end
+			end
+		end
+
+		if not moderatorDetectionPrompt.Visible then return end
+
+		moderatorDetectionPrompt.Serverhop.Visible = serversAvailable
+		moderatorDetectionPrompt.ServersAvailableFade.Visible = serversAvailable
+	end)
 
 	tweenService:Create(moderatorDetectionPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {BackgroundTransparency = 0}):Play()
 	tweenService:Create(moderatorDetectionPrompt, TweenInfo.new(0.8, Enum.EasingStyle.Quint), {Size = UDim2.new(0, 300, 0, 186)}):Play()
@@ -2315,7 +2194,7 @@ function promptModerator(player, role)
 	task.wait(0.3)
 	tweenService:Create(moderatorDetectionPrompt.Close, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {ImageTransparency = 0.6}):Play()
 
-	local function closeModPrompt()
+	closeModPrompt = function()
 		tweenService:Create(moderatorDetectionPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {BackgroundTransparency = 1}):Play()
 		tweenService:Create(moderatorDetectionPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Size = UDim2.new(0, 283, 0, 175)}):Play()
 		tweenService:Create(moderatorDetectionPrompt.UIGradient, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Offset = Vector2.new(0, 1)}):Play()
@@ -2333,34 +2212,13 @@ function promptModerator(player, role)
 		task.wait(0.5)
 		moderatorDetectionPrompt.Visible = false
 	end
-
-	moderatorDetectionPrompt.Leave.MouseButton1Click:Connect(function()
-		closeModPrompt()
-		game:Shutdown()
-	end)
-
-	moderatorDetectionPrompt.Serverhop.MouseEnter:Connect(function()
-		tweenService:Create(moderatorDetectionPrompt.ServersAvailableFade, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 0.5}):Play()
-	end)
-
-	moderatorDetectionPrompt.Serverhop.MouseLeave:Connect(function()
-		tweenService:Create(moderatorDetectionPrompt.ServersAvailableFade, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
-	end)
-
-	moderatorDetectionPrompt.Serverhop.MouseButton1Click:Connect(function()
-		if promptClosed then return end
-		serverhop()
-		closeModPrompt()
-	end)
-
-	moderatorDetectionPrompt.Close.MouseButton1Click:Connect(function()
-		closeModPrompt()
-		promptClosed = true
-	end)
 end
 
 local function UpdateHome()
 	if not checkSirius() then return end
+	-- Home used to refresh every second whether or not it was on screen, which meant a paginated
+	-- GetFriendsAsync every 25s for a panel the player may never have opened.
+	if not homeContainer.Visible then return end
 
 	local function format(Int)
 		return string.format("%02i", Int)
@@ -2396,8 +2254,19 @@ local function UpdateHome()
 	homeContainer.Interactions.User.Subtitle.Text = localPlayer.Name
 
 	-- Update Executor
-	homeContainer.Interactions.Client.Title.Text = identifyexecutor()
-	if not table.find(siriusValues.executors, string.lower(identifyexecutor())) then
+	-- identifyexecutor isn't universal. Calling it bare threw once per second here, which took
+	-- every other field in this function down with it.
+	local executorName
+	if getExecutorName then
+		local nameSuccess, name = pcall(getExecutorName)
+		executorName = (nameSuccess and type(name) == "string" and #name > 0) and name or nil
+	end
+
+	homeContainer.Interactions.Client.Title.Text = executorName or "Unknown Executor"
+
+	if not executorName then
+		homeContainer.Interactions.Client.Subtitle.Text = "Sirius couldn't identify this executor - it may still work just fine."
+	elseif not table.find(siriusValues.executors, string.lower(executorName)) then
 		homeContainer.Interactions.Client.Subtitle.Text = "This executor is not verified as supported - but may still work just fine."
 	end
 
@@ -2409,6 +2278,16 @@ local function openHome()
 	if debounce then return end
 	debounce = true
 	homeContainer.Visible = true
+
+	-- UpdateHome now no-ops while Home is hidden, so populate it once on the way in rather than
+	-- showing up to a second of stale values.
+	task.spawn(UpdateHome)
+
+	-- The FOV the player had before Home touched it. Open used to add 5, then read the camera
+	-- again mid-tween and subtract 40 from that moving value, and close added a flat 35 back -
+	-- so the FOV drifted a little further on every open/close cycle.
+	local restoreFieldOfView = camera.FieldOfView
+	homeFieldOfView = restoreFieldOfView
 
 	local homeBlur = Instance.new("BlurEffect", lighting)
 	homeBlur.Size = 0
@@ -2437,37 +2316,36 @@ local function openHome()
 	tweenService:Create(homeContainer, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {BackgroundTransparency = 0.9}):Play()
 	tweenService:Create(homeBlur, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {Size = 5}):Play()
 
-	tweenService:Create(camera, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {FieldOfView = camera.FieldOfView + 5}):Play()
+	tweenService:Create(camera, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {FieldOfView = restoreFieldOfView + 5}):Play()
 
 	task.wait(0.25)
 
-	for _, inGameUI in ipairs(localPlayer:FindFirstChildWhichIsA("PlayerGui"):GetChildren()) do
-		if inGameUI:IsA("ScreenGui") then
-			if inGameUI.Enabled then
-				if not table.find(getgenv().cachedInGameUI, inGameUI.Name) then
-					table.insert(getgenv().cachedInGameUI, #getgenv().cachedInGameUI+1, inGameUI.Name)
-				end
+	local playerGui = localPlayer:FindFirstChildWhichIsA("PlayerGui")
 
+	table.clear(env.cachedInGameUI)
+
+	if playerGui then
+		for _, inGameUI in ipairs(playerGui:GetChildren()) do
+			if inGameUI:IsA("ScreenGui") and inGameUI.Enabled and inGameUI ~= UI then
+				table.insert(env.cachedInGameUI, inGameUI)
 				inGameUI.Enabled = false
 			end
 		end
 	end
 
-	table.clear(getgenv().cachedCoreUI)
+	table.clear(env.cachedCoreUI)
 
-	for _, coreUI in pairs({"PlayerList", "Chat", "EmotesMenu", "Health", "Backpack"}) do
-		if game:GetService("StarterGui"):GetCoreGuiEnabled(coreUI) then
-			table.insert(getgenv().cachedCoreUI, #getgenv().cachedCoreUI+1, coreUI)
+	for _, coreUI in ipairs({"PlayerList", "Chat", "EmotesMenu", "Health", "Backpack"}) do
+		local coreSuccess, enabled = pcall(starterGui.GetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI])
+		if coreSuccess and enabled then
+			table.insert(env.cachedCoreUI, coreUI)
+			pcall(starterGui.SetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI], false)
 		end
-	end
-
-	for _, coreUI in pairs(getgenv().cachedCoreUI) do
-		game:GetService("StarterGui"):SetCoreGuiEnabled(coreUI, false)
 	end
 
 	createReverb(0.8)
 
-	tweenService:Create(camera, TweenInfo.new(0.8, Enum.EasingStyle.Quint), {FieldOfView = camera.FieldOfView - 40}):Play()
+	tweenService:Create(camera, TweenInfo.new(0.8, Enum.EasingStyle.Quint), {FieldOfView = math.max(restoreFieldOfView - 35, 20)}):Play()
 
 	tweenService:Create(homeContainer, TweenInfo.new(0.8, Enum.EasingStyle.Quint), {BackgroundTransparency = 0.7}):Play()
 	tweenService:Create(homeContainer.Title, TweenInfo.new(0.8, Enum.EasingStyle.Quint), {TextTransparency = 0}):Play()
@@ -2517,7 +2395,8 @@ local function closeHome()
 	if debounce then return end
 	debounce = true
 
-	tweenService:Create(camera, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {FieldOfView = camera.FieldOfView + 35}):Play()
+	-- Restore the exact FOV Home was opened at instead of adding a fixed amount back
+	tweenService:Create(camera, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {FieldOfView = homeFieldOfView or baseFieldOfView}):Play()
 
 	for _, obj in ipairs(lighting:GetChildren()) do
 		if obj.Name == "HomeBlur" then
@@ -2535,11 +2414,7 @@ local function closeHome()
 			if otherHomeItem.ClassName == "Frame" then
 				tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {BackgroundTransparency = 1}):Play()
 			elseif otherHomeItem.ClassName == "TextLabel" then
-				if otherHomeItem.Name == "Title" then
-					tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
-				else
-					tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
-				end
+				tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {TextTransparency = 1}):Play()
 			elseif otherHomeItem.ClassName == "ImageLabel" then
 				tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {BackgroundTransparency = 1}):Play()
 				tweenService:Create(otherHomeItem, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
@@ -2551,17 +2426,19 @@ local function closeHome()
 
 	task.wait(0.2)
 
-	for _, cachedInGameUIObject in pairs(getgenv().cachedInGameUI) do
-		for _, currentPlayerUI in ipairs(localPlayer:FindFirstChildWhichIsA("PlayerGui"):GetChildren()) do
-			if table.find(getgenv().cachedInGameUI, currentPlayerUI.Name) then
-				currentPlayerUI.Enabled = true
-			end 
+	-- Instances, not names. Matching by name re-enabled any interface sharing a name with one we
+	-- hid, and the old nested loop walked the whole PlayerGui once per cached entry.
+	for _, cachedUI in ipairs(env.cachedInGameUI) do
+		if cachedUI.Parent then
+			cachedUI.Enabled = true
 		end
 	end
+	table.clear(env.cachedInGameUI)
 
-	for _, coreUI in pairs(getgenv().cachedCoreUI) do
-		game:GetService("StarterGui"):SetCoreGuiEnabled(coreUI, true)
+	for _, coreUI in ipairs(env.cachedCoreUI) do
+		pcall(starterGui.SetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI], true)
 	end
+	table.clear(env.cachedCoreUI)
 
 	removeReverbs(0.5)
 
@@ -2647,7 +2524,7 @@ local function createScript(result)
 	task.spawn(function()
 		local response
 
-		local success, ErrorStatement = pcall(function()
+		local success = pcall(function()
 			local responseRequest = httpRequest({
 				Url = "https://www.scriptblox.com/api/script/"..result['slug'],
 				Method = "GET"
@@ -2706,9 +2583,27 @@ local function createScript(result)
 	newScript.Tags.Patched.Visible = result.isPatched or false
 
 	newScript.Execute.MouseButton1Click:Connect(function()
+		-- The search endpoint doesn't always include a script body; loadstring(nil) threw here
+		if type(result.script) ~= "string" or #result.script == 0 then
+			queueNotification("ScriptSearch", "ScriptBlox didn't return a script body for "..result.title..".", 4384402990)
+			return
+		end
+
 		queueNotification("ScriptSearch", "Running "..result.title.. " via ScriptSearch" , 4384403532)
 		closeScriptSearch()
-		loadstring(result.script)()
+
+		-- A third-party script that fails to compile or errors on load shouldn't surface as an
+		-- unexplained Sirius error
+		local chunk, compileError = loadstring(result.script)
+		if not chunk then
+			queueNotification("ScriptSearch", "Couldn't run "..result.title..": "..tostring(compileError), 4384402990)
+			return
+		end
+
+		local runSuccess, runError = pcall(chunk)
+		if not runSuccess then
+			queueNotification("ScriptSearch", result.title.." errored while running: "..tostring(runError), 4384402990)
+		end
 	end)
 end
 
@@ -2717,13 +2612,36 @@ local function extractDomain(link)
 	return domainToReturn
 end
 
+-- Reading the allowlist sits on the hot path of the request hook, so a corrupt or truncated
+-- allowedLinks.srs used to throw out of JSONDecode and break every HTTP request in the session.
+local function readAllowlist()
+	if not (isfile and readfile) then return nil end
+
+	local path = siriusValues.siriusFolder.."/".."allowedLinks.srs"
+	local readSuccess, raw = pcall(function()
+		return isfile(path) and readfile(path) or nil
+	end)
+
+	if not readSuccess or not raw then return nil end
+
+	local decodeSuccess, decoded = pcall(httpService.JSONDecode, httpService, raw)
+	if not decodeSuccess or type(decoded) ~= "table" then
+		warn("Sirius | allowedLinks.srs was unreadable and has been ignored")
+		return nil
+	end
+
+	return decoded
+end
+
+local SECURITY_PROMPT_TIMEOUT = 60 -- seconds before an unanswered prompt denies by default
+
 local function securityDetection(title, content, link, gradient, actions)
 	if not checkSirius() then return end
 
 	local domain = extractDomain(link) or link
 	checkFolder()
-	local currentAllowlist = isfile and isfile(siriusValues.siriusFolder.."/".."allowedLinks.srs") and readfile(siriusValues.siriusFolder.."/".."allowedLinks.srs") or nil
-	if currentAllowlist then currentAllowlist = httpService:JSONDecode(currentAllowlist) if table.find(currentAllowlist, domain) then return true end end
+	local currentAllowlist = readAllowlist()
+	if currentAllowlist and table.find(currentAllowlist, domain) then return true end
 
 	local newSecurityPrompt = securityPrompt:Clone()
 
@@ -2771,15 +2689,14 @@ local function securityDetection(title, content, link, gradient, actions)
 		newAction.Size = UDim2.new(0, newAction.TextBounds.X + 50, 0, 36) -- textbounds
 
 		newAction.MouseButton1Click:Connect(function()
+			if decision ~= nil then return end -- one answer per prompt
+
 			if action[2] then
-				if action[3] then
+				if action[3] and writefile then
 					checkFolder()
-					if currentAllowlist then
-						table.insert(currentAllowlist, domain)
-						writefile(siriusValues.siriusFolder.."/".."allowedLinks.srs", httpService:JSONEncode(currentAllowlist))
-					else
-						writefile(siriusValues.siriusFolder.."/".."allowedLinks.srs", httpService:JSONEncode({domain}))
-					end
+					local allowed = currentAllowlist or {}
+					table.insert(allowed, domain)
+					pcall(writefile, siriusValues.siriusFolder.."/".."allowedLinks.srs", httpService:JSONEncode(allowed))
 				end
 				decision = true
 			else
@@ -2817,60 +2734,91 @@ local function securityDetection(title, content, link, gradient, actions)
 		tweenService:Create(newSecurityPrompt.FoundLink, TweenInfo.new(0.5, Enum.EasingStyle.Quint),  {TextTransparency = 0.2}):Play()
 	end)
 
-	repeat task.wait() until decision ~= nil
+	-- An unanswered prompt used to park the calling script forever, because the request hook is
+	-- synchronous. Time out and deny instead - failing closed is the safe direction here.
+	local deadline = os.clock() + SECURITY_PROMPT_TIMEOUT
+	while decision == nil do
+		if os.clock() > deadline then
+			decision = false
+			task.spawn(closeSecurityPrompt)
+			break
+		end
+		if not newSecurityPrompt.Parent then
+			decision = false
+			break
+		end
+		task.wait()
+	end
+
 	return decision
 end
 
-if Essential or Pro then
-	getgenv()[index] = function(data)
-		if checkSirius() and checkSetting("Intelligent HTTP Interception").current then
-			local title = "Do you trust this source?"
-			local content = "Sirius has prevented data from being sent off-client, would you like to allow data to be sent or retrieved from this source?"
-			local url = data.Url or "Unknown Link"
-			local gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.764706, 0.305882, 0.0941176))})
-			local actions = {{"Always Allow", true, true}, {"Allow just this once", true}, {"Don't Allow", false}}
-
-			if url == "http://127.0.0.1:6463/rpc?v=1" then
-				local bodyDecoded = httpService:JSONDecode(data.Body)
-
-				if bodyDecoded.cmd == "INVITE_BROWSER" then
-					title = "Would you like to join this Discord server?"
-					content = "Sirius has prevented your Discord client from automatically joining this Discord server, would you like to continue and join, or block it?"
-					url = bodyDecoded.args and "discord.gg/"..bodyDecoded.args.code or "Unknown Invite"
-					gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.345098, 0.396078, 0.94902))})
-					actions = {{"Allow", true}, {"Don't Allow", false}}
-				end
-			end
-
-			local answer = securityDetection(title, content, url, gradient, actions)
-
-
-			if answer then 
-				return originalRequest(data)
-			else
-				return
-			end
-		else
+-- Only install the interception hooks if there's something real to fall back to; the old code
+-- replaced the global unconditionally, so on an executor without a request function the
+-- replacement ended up calling nil.
+if originalRequest then
+	env[index] = function(data)
+		-- Callers can pass anything; the old code indexed data.Url straight away
+		if type(data) ~= "table" then
 			return originalRequest(data)
 		end
+
+		if not (checkSirius() and settingValue("Intelligent HTTP Interception")) then
+			return originalRequest(data)
+		end
+
+		local title = "Do you trust this source?"
+		local content = "Sirius has prevented data from being sent off-client, would you like to allow data to be sent or retrieved from this source?"
+		local url = data.Url or data.url or "Unknown Link"
+		local gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.764706, 0.305882, 0.0941176))})
+		local actions = {{"Always Allow", true, true}, {"Allow just this once", true}, {"Don't Allow", false}}
+
+		if url == "http://127.0.0.1:6463/rpc?v=1" and data.Body then
+			-- A malformed RPC body used to throw straight out of the hook
+			local decodeSuccess, bodyDecoded = pcall(httpService.JSONDecode, httpService, data.Body)
+
+			if decodeSuccess and type(bodyDecoded) == "table" and bodyDecoded.cmd == "INVITE_BROWSER" then
+				title = "Would you like to join this Discord server?"
+				content = "Sirius has prevented your Discord client from automatically joining this Discord server, would you like to continue and join, or block it?"
+				url = bodyDecoded.args and bodyDecoded.args.code and "discord.gg/"..bodyDecoded.args.code or "Unknown Invite"
+				gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.345098, 0.396078, 0.94902))})
+				actions = {{"Allow", true}, {"Don't Allow", false}}
+			end
+		end
+
+		if securityDetection(title, content, url, gradient, actions) then
+			return originalRequest(data)
+		end
+
+		-- Callers expect a response table; returning nothing made them error on the denial path
+		return {
+			Success = false,
+			StatusCode = 403,
+			StatusMessage = "Blocked by Sirius",
+			Headers = {},
+			Body = "",
+		}
 	end
 
-	getgenv()[indexSetClipboard] = function(data)
-		if checkSirius() and checkSetting("Intelligent Clipboard Interception").current then
-			local title = "Would you like to copy this to your clipboard?"
-			local content = "Sirius has prevented a script from setting the below text to your clipboard, would you like to allow this, or prevent it from copying?"
-			local url = data or "Unknown Clipboard"
-			local gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.776471, 0.611765, 0.529412))})
-			local actions = {{"Allow", true}, {"Don't Allow", false}}
+	-- Executors expose the same function under several names; keep them all pointing at the hook
+	for _, alias in ipairs({"request", "http_request"}) do
+		if env[alias] then env[alias] = env[index] end
+	end
+end
 
-			local answer = securityDetection(title, content, url, gradient, actions)
+if originalSetClipboard then
+	env[indexSetClipboard] = function(data)
+		if not (checkSirius() and settingValue("Intelligent Clipboard Interception")) then
+			return originalSetClipboard(data)
+		end
 
-			if answer then 
-				return originalSetClipboard(data)
-			else
-				return
-			end
-		else
+		local title = "Would you like to copy this to your clipboard?"
+		local content = "Sirius has prevented a script from setting the below text to your clipboard, would you like to allow this, or prevent it from copying?"
+		local url = tostring(data or "Unknown Clipboard")
+		local gradient = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),ColorSequenceKeypoint.new(1, Color3.new(0.776471, 0.611765, 0.529412))})
+		local actions = {{"Allow", true}, {"Don't Allow", false}}
+
+		if securityDetection(title, content, url, gradient, actions) then
 			return originalSetClipboard(data)
 		end
 	end
@@ -2880,7 +2828,13 @@ end
 local function searchScriptBlox(query)
 	local response
 
-	local success, ErrorStatement = pcall(function()
+	if not httpRequest then
+		queueNotification("ScriptSearch", "ScriptSearch needs an executor with a request function, and this one doesn't expose it.", 4384402990)
+		closeScriptSearch()
+		return
+	end
+
+	local success = pcall(function()
 		local responseRequest = httpRequest({
 			Url = "https://scriptblox.com/api/script/search?q="..httpService:UrlEncode(query).."&mode=free&max=20&page=1",
 			Method = "GET"
@@ -2889,7 +2843,9 @@ local function searchScriptBlox(query)
 		response = httpService:JSONDecode(responseRequest.Body)
 	end)
 
-	if not success then
+	-- The old code checked `success` here but then indexed response.result.scripts further down
+	-- without ever checking that the shape was what it expected
+	if not success or type(response) ~= "table" or type(response.result) ~= "table" or type(response.result.scripts) ~= "table" then
 		queueNotification("ScriptSearch", "ScriptSearch backend encountered an error, try again later", 4384402990)
 		closeScriptSearch()
 		return
@@ -2920,35 +2876,37 @@ local function searchScriptBlox(query)
 	tweenService:Create(scriptSearch.SearchBox, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {Position = UDim2.new(0.523, 0, 0.056, 0)}):Play()
 	tweenService:Create(scriptSearch.UIGradient, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {Offset = Vector2.new(0, 0.6)}):Play()
 
-	if response then
-		local scriptCreated = false
-		for _, scriptResult in pairs(response.result.scripts) do
-			local success, response = pcall(function()
-				createScript(scriptResult)
-			end)
-
+	local scriptCreated = false
+	for _, scriptResult in ipairs(response.result.scripts) do
+		-- scriptCreated used to be set even when createScript threw, so a page of failures
+		-- still reported as results
+		if pcall(createScript, scriptResult) then
 			scriptCreated = true
 		end
-
-		if not scriptCreated then
-			task.wait(0.2)
-			tweenService:Create(scriptSearch.NoScriptsTitle, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
-			task.wait(0.1)
-			tweenService:Create(scriptSearch.NoScriptsDesc, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
-		else
-			tweenService:Create(scriptSearch.List, TweenInfo.new(.3,Enum.EasingStyle.Quint),  {ScrollBarImageTransparency = 0}):Play()
-		end
-	else
-		queueNotification("ScriptSearch", "ScriptSearch backend encountered an error, try again later", 4384402990)
-		closeScriptSearch()
-		return
 	end
+
+	if not scriptCreated then
+		task.wait(0.2)
+		tweenService:Create(scriptSearch.NoScriptsTitle, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
+		task.wait(0.1)
+		tweenService:Create(scriptSearch.NoScriptsDesc, TweenInfo.new(.5,Enum.EasingStyle.Quint),  {TextTransparency = 0}):Play()
+	else
+		tweenService:Create(scriptSearch.List, TweenInfo.new(.3,Enum.EasingStyle.Quint),  {ScrollBarImageTransparency = 0}):Play()
+	end
+end
+
+-- coreGui.RobloxGui.Backpack was indexed directly in three places. RobloxGui isn't guaranteed to
+-- exist (and its layout has moved before), so a miss threw on the very first smartBar open.
+local function getRobloxBackpack()
+	local robloxGui = coreGui:FindFirstChild("RobloxGui")
+	return robloxGui and robloxGui:FindFirstChild("Backpack")
 end
 
 local function openSmartBar()
 	smartBarOpen = true
 
-	coreGui.RobloxGui.Backpack.Position = UDim2.new(0,0,0,0)
+	local backpack = getRobloxBackpack()
+	if backpack then backpack.Position = UDim2.new(0,0,0,0) end
 
 	-- Set Values for frame properties
 	smartBar.BackgroundTransparency = 1
@@ -2959,7 +2917,7 @@ local function openSmartBar()
 	smartBar.Position = UDim2.new(0.5, 0, 1.05, 0)
 	smartBar.Size = UDim2.new(0, 531, 0, 64)
 	toggle.Rotation = 180
-	toggle.Visible = not checkSetting("Hide Toggle Button").current
+	toggle.Visible = not settingValue("Hide Toggle Button")
 
 	if checkTools() then
 		toggle.Position = UDim2.new(0.5,0,1,-68)
@@ -2977,7 +2935,9 @@ local function openSmartBar()
 		button.Icon.ImageTransparency = 1
 	end
 
-	tweenService:Create(coreGui.RobloxGui.Backpack, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Position = UDim2.new(-0.325,0,0,0)}):Play()
+	if backpack then
+		tweenService:Create(backpack, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Position = UDim2.new(-0.325,0,0,0)}):Play()
+	end
 
 	tweenService:Create(toggle, TweenInfo.new(0.82, Enum.EasingStyle.Quint), {Rotation = 0}):Play()
 	tweenService:Create(smartBar, TweenInfo.new(0.7, Enum.EasingStyle.Quint), {Position = UDim2.new(0.5, 0, 1, -12)}):Play()
@@ -3022,7 +2982,10 @@ local function closeSmartBar()
 		tweenService:Create(Button.Icon, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
 	end
 
-	tweenService:Create(coreGui.RobloxGui.Backpack, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Position = UDim2.new(0, 0, 0, 0)}):Play()
+	local backpack = getRobloxBackpack()
+	if backpack then
+		tweenService:Create(backpack, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Position = UDim2.new(0, 0, 0, 0)}):Play()
+	end
 
 	tweenService:Create(smartBar, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.InOut), {BackgroundTransparency = 1}):Play()
 	tweenService:Create(smartBar.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {Transparency = 1}):Play()
@@ -3043,19 +3006,60 @@ local function closeSmartBar()
 end
 
 local function windowFocusChanged(value)
-	if checkSirius() then
-		if value then -- Window Focused
-			setfpscap(tonumber(checkSetting("Artificial FPS Limit").current))
-			removeReverbs(0.5)
-		else          -- Window unfocused
-			if checkSetting("Muffle audio while unfocused").current then createReverb(0.7) end
-			if checkSetting("Limit FPS while unfocused").current then setfpscap(60) end
+	if not checkSirius() then return end
+
+	if value then -- Window Focused
+		-- setfpscap isn't present on every executor. This ran on the startup path via start(),
+		-- so calling it bare aborted the entire script before any UI or events were wired up.
+		if setFpsCap then
+			local cap = tonumber(settingValue("Artificial FPS Limit"))
+			if cap then pcall(setFpsCap, cap) end
 		end
+		removeReverbs(0.5)
+	else          -- Window unfocused
+		if settingValue("Muffle audio while unfocused") then createReverb(0.7) end
+		if setFpsCap and settingValue("Limit FPS while unfocused") then pcall(setFpsCap, 60) end
 	end
 end
 
+-- SetCore("ChatMakeSystemMessage") only reaches the legacy chat window. On TextChatService the
+-- equivalent is DisplaySystemMessage on a channel we're actually in.
+local function displaySystemMessage(visuals)
+	if legacyChatActive then
+		local success = pcall(starterGui.SetCore, starterGui, "ChatMakeSystemMessage", visuals)
+		if success then return end
+	end
+
+	pcall(function()
+		local channels = textChatService:FindFirstChild("TextChannels")
+		local general = channels and channels:FindFirstChild("RBXGeneral")
+		if general then
+			general:DisplaySystemMessage(visuals.Text)
+		end
+	end)
+end
+
+-- Webhook posts were duplicated across three call sites, each building the same table and each
+-- firing at a placeholder URL when logging was on but no webhook had been set.
+local function postWebhook(url, payload)
+	if not originalRequest then return end
+	if type(url) ~= "string" or not url:match("^https?://") then return end
+
+	local encodeSuccess, body = pcall(httpService.JSONEncode, httpService, payload)
+	if not encodeSuccess then return end
+
+	task.spawn(function()
+		pcall(originalRequest, {
+			Url = url,
+			Method = 'POST',
+			Headers = { ['Content-Type'] = 'application/json' },
+			Body = body,
+		})
+	end)
+end
+
 local function onChatted(player, message)
-	local enabled = checkSetting("Chat Spy").current and siriusValues.chatSpy.enabled
+	local enabled = settingValue("Chat Spy") and siriusValues.chatSpy.enabled
 	local chatSpyVisuals = siriusValues.chatSpy.visual
 
 	if not message or not checkSirius() then return end
@@ -3077,68 +3081,88 @@ local function onChatted(player, message)
 
 		if hidden and enabled then
 			chatSpyVisuals.Text = "Sirius Spy - [".. player.Name .."]: "..message2
-			starterGui:SetCore("ChatMakeSystemMessage", chatSpyVisuals)
+			displaySystemMessage(chatSpyVisuals)
 		end
 	end
 
-	if checkSetting("Log Messages").current then
-		local logData = {
+	if settingValue("Log Messages") then
+		postWebhook(settingValue("Message Webhook URL"), {
 			["content"] = message,
 			["avatar_url"] = "https://www.roblox.com/headshot-thumbnail/image?userId="..player.UserId.."&width=420&height=420&format=png",
 			["username"] = player.DisplayName,
 			["allowed_mentions"] = {parse = {}}
-		}
-
-		logData = httpService:JSONEncode(logData)
-
-		pcall(function()
-			local req = originalRequest({
-				Url = checkSetting("Message Webhook URL").current,
-				Method = 'POST',
-				Headers = {
-					['Content-Type'] = 'application/json',
-				},
-				Body = logData
-			})
-		end)
+		})
 	end
 end
 
 local function sortPlayers()
-	local newTable = playerlistPanel.Interactions.List:GetChildren()
-
-	for index, player in ipairs(newTable) do
-		if player.ClassName ~= "Frame" or player.Name == "Placeholder" then
-			table.remove(newTable, index)
+	-- The old version called table.remove while iterating the same array with ipairs, so every
+	-- removal shifted the list under the iterator and half the entries were skipped - leaving
+	-- Template/Placeholder frames in the sort and mis-ordering the rest.
+	local entries = {}
+	for _, child in ipairs(playerlistPanel.Interactions.List:GetChildren()) do
+		if child.ClassName == "Frame" and child.Name ~= "Placeholder" and child.Name ~= "Template" then
+			table.insert(entries, child)
 		end
 	end
 
-	table.sort(newTable, function(playerA, playerB)
-		return playerA.Name < playerB.Name
+	table.sort(entries, function(playerA, playerB)
+		return playerA.Name:lower() < playerB.Name:lower()
 	end)
 
-	for index, frame in ipairs(newTable) do
-		if frame.ClassName == "Frame" then
-			if frame.Name ~= "Placeholder" then
-				frame.LayoutOrder = index 
-			end
-		end
+	for index, frame in ipairs(entries) do
+		frame.LayoutOrder = index
 	end
 end
 
-local function kill(player)
-	-- kill
+-- Spectate: point the camera at another player's humanoid and restore it on toggle-off. Kept
+-- purely client-side, so it works anywhere without touching the server.
+local spectating
+
+local function restoreCamera()
+	spectating = nil
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		camera.CameraSubject = humanoid
+	end
+	camera.CameraType = Enum.CameraType.Custom
+end
+
+local function toggleSpectate(player)
+	if spectating == player then
+		restoreCamera()
+		queueNotification("Stopped Spectating", "Camera returned to your character.", 4400696294)
+		return false
+	end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+	if not humanoid then
+		queueNotification("Unable to Spectate", player.DisplayName.." doesn't have a loaded character right now.", 4370317928)
+		return false
+	end
+
+	spectating = player
+	camera.CameraSubject = humanoid
+	camera.CameraType = Enum.CameraType.Custom
+	queueNotification("Spectating", "Now spectating "..player.DisplayName..".", 4400696294)
+	return true
 end
 
 local function teleportTo(player)
-	local targetCharacter = workspace:FindFirstChild(player.Name)
+	-- player.Character rather than a workspace name lookup: plenty of experiences reparent or
+	-- rename characters, and the name lookup would happily match an unrelated part.
+	local targetCharacter = player.Character
 	local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
 	local localCharacter = localPlayer.Character
 	local localRoot = localCharacter and localCharacter:FindFirstChild("HumanoidRootPart")
 
-	if players:FindFirstChild(player.Name) and targetRoot and localRoot then
+	if targetRoot and localRoot then
 		queueNotification("Teleportation", "Teleporting to "..player.DisplayName..".")
-		localRoot.CFrame = CFrame.new(targetRoot.Position.X, targetRoot.Position.Y, targetRoot.Position.Z)
+		-- Preserve our own orientation instead of snapping to an identity rotation
+		localRoot.CFrame = CFrame.new(targetRoot.Position) * (localRoot.CFrame - localRoot.CFrame.Position)
 	else
 		queueNotification("Teleportation Error", player.DisplayName.." cannot be teleported to right now.")
 	end
@@ -3259,17 +3283,10 @@ local function createPlayer(player)
 		tweenService:Create(newPlayer.UIStroke, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {Transparency = 0}):Play()
 	end)
 
-	newPlayer.PlayerInteractions.Kill.Interact.MouseButton1Click:Connect(function()
-		queueNotification("Simulation Notification","Simulating Kill Notification for "..player.DisplayName..".")
-		tweenService:Create(newPlayer.PlayerInteractions.Kill, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {BackgroundColor3 = Color3.fromRGB(0, 124, 89)}):Play()
-		tweenService:Create(newPlayer.PlayerInteractions.Kill.Icon, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {ImageColor3 = Color3.fromRGB(220, 220, 220)}):Play()
-		tweenService:Create(newPlayer.PlayerInteractions.Kill.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Color = Color3.fromRGB(0, 134, 96)}):Play()
-		kill(player)
-		task.wait(1)
-		tweenService:Create(newPlayer.PlayerInteractions.Kill, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {BackgroundColor3 = Color3.fromRGB(50, 50, 50)}):Play()
-		tweenService:Create(newPlayer.PlayerInteractions.Kill.Icon, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {ImageColor3 = Color3.fromRGB(100, 100, 100)}):Play()
-		tweenService:Create(newPlayer.PlayerInteractions.Kill.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Color = Color3.fromRGB(60, 60, 60)}):Play()
-	end)
+	-- Kill was never implemented - the handler played a colour animation and raised a
+	-- "Simulating Kill Notification" toast. Killing another player is server-authoritative and
+	-- can't be done generically from the client, so the button is hidden rather than faked.
+	newPlayer.PlayerInteractions.Kill.Visible = false
 
 	newPlayer.PlayerInteractions.Teleport.Interact.MouseButton1Click:Connect(function()
 		tweenService:Create(newPlayer.PlayerInteractions.Teleport, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {BackgroundColor3 = Color3.fromRGB(0, 152, 111)}):Play()
@@ -3282,9 +3299,16 @@ local function createPlayer(player)
 		tweenService:Create(newPlayer.PlayerInteractions.Teleport.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Color = Color3.fromRGB(60, 60, 60)}):Play()
 	end)
 
+	-- Spectate now actually spectates instead of raising a "Simulating Spectate" toast
 	newPlayer.PlayerInteractions.Spectate.Interact.MouseButton1Click:Connect(function()
-		queueNotification("Simulation Notification","Simulating Spectate Notification for "..player.DisplayName..".")
-		-- Spectate
+		local nowSpectating = toggleSpectate(player)
+
+		local activeColor = Color3.fromRGB(0, 152, 111)
+		local idleColor = Color3.fromRGB(50, 50, 50)
+
+		tweenService:Create(newPlayer.PlayerInteractions.Spectate, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {BackgroundColor3 = nowSpectating and activeColor or idleColor}):Play()
+		tweenService:Create(newPlayer.PlayerInteractions.Spectate.Icon, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {ImageColor3 = nowSpectating and Color3.fromRGB(220, 220, 220) or Color3.fromRGB(100, 100, 100)}):Play()
+		tweenService:Create(newPlayer.PlayerInteractions.Spectate.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Quint), {Color = nowSpectating and activeColor or Color3.fromRGB(60, 60, 60)}):Play()
 	end)
 
 	newPlayer.PlayerInteractions.Locate.Interact.MouseButton1Click:Connect(function()
@@ -3417,45 +3441,76 @@ local function closeSettings()
 	debounce = false
 end
 
+-- The whole siriusSettings tree used to be serialised, including Color3 values and the keybind
+-- callback functions, which meant the file carried a copy of the UI metadata and silently
+-- dropped anything JSONEncode couldn't represent. Only { id = current } is persisted now, so the
+-- file is small, stable across releases, and a stale key can't collide with anything.
+local function settingsPath()
+	return siriusValues.siriusFolder.."/"..siriusValues.settingsFile
+end
+
 local function saveSettings()
+	if not writefile then return end
+
 	checkFolder()
 
-	if writefile then
-		writefile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile, httpService:JSONEncode(siriusSettings))
+	local flat = {}
+	for _, category in ipairs(siriusSettings) do
+		for _, setting in ipairs(category.categorySettings) do
+			if setting.current ~= nil then
+				flat[setting.id] = setting.current
+			end
+		end
 	end
+
+	local encodeSuccess, encoded = pcall(httpService.JSONEncode, httpService, flat)
+	if not encodeSuccess then
+		warn("Sirius | Unable to encode settings: "..tostring(encoded))
+		return
+	end
+
+	pcall(writefile, settingsPath(), encoded)
 end
 
 local function assembleSettings()
-	if isfile and isfile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile) then
-		local currentSettings
-
-		local success, response = pcall(function()
-			currentSettings = httpService:JSONDecode(readfile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile))
+	if isfile and readfile and isfile(settingsPath()) then
+		local success, stored = pcall(function()
+			return httpService:JSONDecode(readfile(settingsPath()))
 		end)
 
-		if success then
-			for _, liveCategory in ipairs(siriusSettings) do
-				for _, liveSetting in ipairs(liveCategory.categorySettings) do
-					for _, category in ipairs(currentSettings) do
-						for _, setting in ipairs(category.categorySettings) do
-							if liveSetting.id == setting.id then
-								liveSetting.current = setting.current
+		if success and type(stored) == "table" then
+			for _, category in ipairs(siriusSettings) do
+				for _, setting in ipairs(category.categorySettings) do
+					-- Read the flat map, but stay compatible with files written by 1.27 and
+					-- earlier, which stored the full nested category tree.
+					local value = stored[setting.id]
+
+					if value == nil and stored[1] then
+						for _, storedCategory in ipairs(stored) do
+							if type(storedCategory) == "table" and type(storedCategory.categorySettings) == "table" then
+								for _, storedSetting in ipairs(storedCategory.categorySettings) do
+									if storedSetting.id == setting.id then
+										value = storedSetting.current
+										break
+									end
+								end
 							end
 						end
 					end
+
+					-- Type-check before applying: a hand-edited or stale file used to be able to
+					-- put a string where a boolean belonged and take out the feature reading it.
+					if value ~= nil and (setting.current == nil or typeof(value) == typeof(setting.current)) then
+						setting.current = value
+					end
 				end
 			end
-
-			writefile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile, httpService:JSONEncode(siriusSettings)) -- Update file with any new settings added
+		else
+			warn("Sirius | Settings file was unreadable and has been reset to defaults")
 		end
-	else
-		if writefile then
-			checkFolder()
-			if not isfile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile) then
-				writefile(siriusValues.siriusFolder.."/"..siriusValues.settingsFile, httpService:JSONEncode(siriusSettings))
-			end
-		end 
 	end
+
+	saveSettings() -- write back, picking up any settings added since the file was created
 
 	settingsPanel.Back.MouseButton1Click:Connect(function()
 		tweenService:Create(settingsPanel.Back, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {ImageTransparency = 1}):Play()
@@ -3596,39 +3651,40 @@ local function assembleSettings()
 					object = newInput
 
 					newInput.Name = setting.name
-					newInput.InputFrame.InputBox.Text = setting.current
 					newInput.InputFrame.InputBox.PlaceholderText = setting.placeholder or "input"
 					newInput.Parent = newList
 
-					if string.len(setting.current) > 19 then
-						newInput.InputFrame.InputBox.Text = string.sub(tostring(setting.current), 1,17)..".."
-					else
-						newInput.InputFrame.InputBox.Text = setting.current
-					end
+					newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 
 					newInput.Visible = true
 					newInput.Title.Text = setting.name
 					newInput.InputFrame.InputBox.TextWrapped = false
 					newInput.InputFrame.Size = UDim2.new(0, newInput.InputFrame.InputBox.TextBounds.X + 24, 0, 30)
 
+					-- Focusing restores the untruncated value. Previously the box displayed a
+					-- shortened "https://discord.com/ap.." and FocusLost wrote whatever was in the
+					-- box straight back to the setting, so simply clicking in and out of the field
+					-- permanently replaced a webhook URL with its truncated form.
+					newInput.InputFrame.InputBox.Focused:Connect(function()
+						newInput.InputFrame.InputBox.Text = tostring(setting.current)
+					end)
+
 					newInput.InputFrame.InputBox.FocusLost:Connect(function()
 						if minimumLicense then
 							if (minimumLicense == "Pro" and not Pro) or (minimumLicense == "Essential" and not (Pro or Essential)) then
 								queueNotification("This feature is locked", "You must be "..minimumLicense.." or higher to use "..setting.name..". \n\nUpgrade at https://sirius.menu.", 4483345875)
-								newInput.InputFrame.InputBox.Text = setting.current
+								newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 								return
 							end
 						end
 
-						if newInput.InputFrame.InputBox.Text ~= nil and newInput.InputFrame.InputBox.Text ~= "" then
-							setting.current = newInput.InputFrame.InputBox.Text
+						local entered = newInput.InputFrame.InputBox.Text
+						if entered ~= nil and entered ~= "" then
+							setting.current = entered
 							saveSettings()
 						end
-						if string.len(setting.current) > 24 then
-							newInput.InputFrame.InputBox.Text = string.sub(tostring(setting.current), 1,22)..".."
-						else
-							newInput.InputFrame.InputBox.Text = setting.current
-						end
+
+						newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 					end)
 
 					newInput.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -3640,27 +3696,25 @@ local function assembleSettings()
 					object = newInput
 
 					newInput.Name = setting.name
-					newInput.InputFrame.InputBox.Text = tostring(setting.current)
 					newInput.InputFrame.InputBox.PlaceholderText = setting.placeholder or "number"
 					newInput.Parent = newList
 
-					if string.len(setting.current) > 19 then
-						newInput.InputFrame.InputBox.Text = string.sub(tostring(setting.current), 1,17)..".."
-					else
-						newInput.InputFrame.InputBox.Text = setting.current
-					end
+					newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 
 					newInput.Visible = true
 					newInput.Title.Text = setting.name
 					newInput.InputFrame.InputBox.TextWrapped = false
 					newInput.InputFrame.Size = UDim2.new(0, newInput.InputFrame.InputBox.TextBounds.X + 24, 0, 30)
 
-					newInput.InputFrame.InputBox.FocusLost:Connect(function()
+					newInput.InputFrame.InputBox.Focused:Connect(function()
+						newInput.InputFrame.InputBox.Text = tostring(setting.current)
+					end)
 
+					newInput.InputFrame.InputBox.FocusLost:Connect(function()
 						if minimumLicense then
 							if (minimumLicense == "Pro" and not Pro) or (minimumLicense == "Essential" and not (Pro or Essential)) then
 								queueNotification("This feature is locked", "You must be "..minimumLicense.." or higher to use "..setting.name..". \n\nUpgrade at https://sirius.menu.", 4483345875)
-								newInput.InputFrame.InputBox.Text = setting.current
+								newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 								return
 							end
 						end
@@ -3669,31 +3723,14 @@ local function assembleSettings()
 
 						if inputValue then
 							if setting.values then
-								local minValue = setting.values[1]
-								local maxValue = setting.values[2]
-
-								if inputValue < minValue then
-									setting.current = minValue
-								elseif inputValue > maxValue then
-									setting.current = maxValue
-								else
-									setting.current = inputValue
-								end
-
-								saveSettings()
+								setting.current = math.clamp(inputValue, setting.values[1], setting.values[2])
 							else
 								setting.current = inputValue
-								saveSettings()
 							end
-						else
-							newInput.InputFrame.InputBox.Text = tostring(setting.current)
+							saveSettings()
 						end
 
-						if string.len(setting.current) > 24 then
-							newInput.InputFrame.InputBox.Text = string.sub(tostring(setting.current), 1,22)..".."
-						else
-							newInput.InputFrame.InputBox.Text = tostring(setting.current)
-						end
+						newInput.InputFrame.InputBox.Text = truncateForDisplay(setting.current)
 					end)
 
 					newInput.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -3796,39 +3833,43 @@ local function assembleSettings()
 end
 
 local function initialiseAntiKick()
-	if checkSetting("Client-Based Anti Kick").current then
-		if hookmetamethod then 
-			local originalIndex
-			local originalNamecall
+	if not settingValue("Client-Based Anti Kick") then return end
+	if not (hookMetamethod and optional(getnamecallmethod)) then return end
 
-			originalIndex = hookmetamethod(game, "__index", function(self, method)
-				if self == localPlayer and method:lower() == "kick" and checkSetting("Client-Based Anti Kick").current and checkSirius() then
-					queueNotification("Kick Prevented", "Sirius has prevented you from being kicked by the client.", 4400699701)
-					return error("Expected ':' not '.' calling member function Kick", 2)
-				end
-				return originalIndex(self, method)
-			end)
+	-- Metamethod hooks can't be undone, so re-running Sirius must not install a second layer
+	if env.siriusAntiKickInstalled then return end
+	env.siriusAntiKickInstalled = true
 
-			originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-				if self == localPlayer and getnamecallmethod():lower() == "kick" and checkSetting("Client-Based Anti Kick").current and checkSirius() then
-					queueNotification("Kick Prevented", "Sirius has prevented you from being kicked by the client.", 4400699701)
-					return
-				end
-				return originalNamecall(self, ...)
-			end)
-		end
+	local hookSuccess, hookError = pcall(function()
+		local originalIndex
+		local originalNamecall
+
+		originalIndex = hookMetamethod(game, "__index", function(self, method)
+			if self == localPlayer and type(method) == "string" and method:lower() == "kick" and settingValue("Client-Based Anti Kick") and checkSirius() then
+				queueNotification("Kick Prevented", "Sirius has prevented you from being kicked by the client.", 4400699701)
+				return error("Expected ':' not '.' calling member function Kick", 2)
+			end
+			return originalIndex(self, method)
+		end)
+
+		originalNamecall = hookMetamethod(game, "__namecall", function(self, ...)
+			if self == localPlayer and getnamecallmethod():lower() == "kick" and settingValue("Client-Based Anti Kick") and checkSirius() then
+				queueNotification("Kick Prevented", "Sirius has prevented you from being kicked by the client.", 4400699701)
+				return
+			end
+			return originalNamecall(self, ...)
+		end)
+	end)
+
+	if not hookSuccess then
+		env.siriusAntiKickInstalled = nil
+		warn("Sirius | Anti Kick could not be installed on this executor: "..tostring(hookError))
 	end
 end
 
 local function boost()
-	local success, result = pcall(function()
-		loadstring(game:HttpGet('https://raw.githubusercontent.com/SiriusSoftwareLtd/Sirius/refs/heads/request/boost.lua'))()
-	end)
-
-	if not success then
-		print('Error with boost file.')
-		print(result)
-	end
+	-- loadWithTimeout so an unreachable CDN can't hang this thread indefinitely
+	loadWithTimeout('https://raw.githubusercontent.com/SiriusSoftwareLtd/Sirius/refs/heads/request/boost.lua')
 end
 
 local function start()
@@ -3848,70 +3889,87 @@ local function start()
 
 	smartBar.Time.Text = os.date("%H")..":"..os.date("%M")
 
-	toggle.Visible = not checkSetting("Hide Toggle Button").current
+	toggle.Visible = not settingValue("Hide Toggle Button")
 
-	if not checkSetting("Load Hidden").current then 
-		--if checkSetting("Startup Sound Effect").current then
-		--	local startupPath = siriusValues.siriusFolder.."/Assets/startup.wav"
-		--	local startupAsset
+	-- Startup sound: fetchFromCDN now actually returns its payload, so this works again
+	if not settingValue("Load Hidden") then
+		if settingValue("Startup Sound Effect") and getCustomAsset and isfile then
+			task.spawn(function()
+				local startupPath = siriusValues.siriusFolder.."/Assets/startup.wav"
 
-		--	if isfile(startupPath) then
-		--		startupAsset = getcustomasset(startupPath) or nil
-		--	else
-		--		startupAsset = fetchFromCDN("startup.wav", true, "Assets/startup.wav")
-		--		startupAsset = isfile(startupPath) and getcustomasset(startupPath) or nil
-		--	end
+				if not isfile(startupPath) then
+					fetchFromCDN("startup.wav", true, "Assets/startup.wav")
+				end
 
-		--	if not startupAsset then return end
+				if not isfile(startupPath) then return end
 
-		--	local startupSound = Instance.new("Sound")
-		--	startupSound.Parent = UI
-		--	startupSound.SoundId = startupAsset
-		--	startupSound.Name = "startupSound"
-		--	startupSound.Volume = 0.85
-		--	startupSound.PlayOnRemove = true
-		--	startupSound:Destroy()	
-		--end
+				local assetSuccess, startupAsset = pcall(getCustomAsset, startupPath)
+				if not assetSuccess or not startupAsset then return end
+
+				local startupSound = Instance.new("Sound")
+				startupSound.Parent = UI
+				startupSound.SoundId = startupAsset
+				startupSound.Name = "startupSound"
+				startupSound.Volume = 0.85
+				startupSound.PlayOnRemove = true
+				startupSound:Destroy()
+			end)
+		end
 
 		openSmartBar()
-	else 
-		closeSmartBar() 
+	else
+		closeSmartBar()
 	end
 
-	if script_key and not (Essential or Pro) then
-		queueNotification("License Error", "We've detected a key being placed above Sirius loadstring, however your key seems to be invalid. Make a support request at sirius.menu/discord to get this solved within minutes.", "document-minus")
+	-- Analytics. loadWithTimeout instead of a bare HttpGet: this sits on the startup path and an
+	-- unreachable raw.githubusercontent used to stall it for the full HTTP timeout. Sampled to
+	-- roughly 1 in 10 launches, matching Rayfield.
+	if math.random(10) == 1 then
+		task.spawn(function()
+			local Analytics = loadWithTimeout("https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/refs/heads/main/reporter.lua")
+			if not Analytics then return end
+
+			pcall(function()
+				local reporter = Analytics.new({
+					url          = "https://rayfield-collect.sirius-software-ltd.workers.dev",
+					token        = "e5b910510792f6604f36a3dd4a3be739da07e2b5f0f502acbc4282afbfc2706a",
+					product_name = "Sirius",
+					category     = "Script",
+				})
+
+				reporter:windowCreated({
+					script_name    = "Sirius",
+					script_version = siriusValues.siriusVersion,
+				})
+			end)
+		end)
 	end
 
-	if siriusValues.enableExperienceSync then
-		task.spawn(syncExperienceInformation) 
+	-- Chat Spy is built on the legacy chat system, which Roblox retired. Rather than appearing
+	-- switched on while doing nothing, say so once.
+	if settingValue("Chat Spy") and not legacyChatActive then
+		task.delay(6, function()
+			queueNotification("Chat Spy unavailable", "This experience uses Roblox's current chat system, which routes whispers through channels your client never receives. Chat Spy only works on the legacy chat system.", 4370336704)
+		end)
 	end
 
-    local fetchSuccess, fetchResult = pcall((game :: any).HttpGet, game, "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/refs/heads/main/reporter.lua")
-
-    if fetchSuccess and #fetchResult > 0 then
-        local execSuccess, Analytics = pcall(function()
-            return (loadstring(fetchResult) :: any)()
-        end)
-
-        if execSuccess and Analytics then
-            local reporter = Analytics.new({
-                url          = "https://rayfield-collect.sirius-software-ltd.workers.dev",
-                token        = "e5b910510792f6604f36a3dd4a3be739da07e2b5f0f502acbc4282afbfc2706a",
-                product_name = "Sirius",
-                category     = "Script", 
-            })
-
-            reporter:windowCreated({
-                script_name    = "Sirius",
-                script_version = siriusValues.siriusVersion,
-            })
-        end
-    end
+	-- Resolved once so the JobId copy button doesn't make a yielding, rate-limitable web call
+	-- from inside a click handler
+	task.spawn(function()
+		local infoSuccess, info = pcall(marketplaceService.GetProductInfo, marketplaceService, placeId)
+		placeName = (infoSuccess and info and info.Name) or "this experience"
+	end)
 end
 
 -- Sirius Events
 
-start()
+-- start() reaches out to the executor, the filesystem and the network. A failure in any one of
+-- those used to take the whole script down before a single event below was connected.
+local startSuccess, startError = pcall(start)
+if not startSuccess then
+	warn("Sirius | Startup error: "..tostring(startError))
+	pcall(queueNotification, "Sirius had trouble starting", "Some features may be unavailable. Report this at sirius.menu/discord: "..tostring(startError), 4370336704)
+end
 
 toggle.MouseButton1Click:Connect(function()
 	if smartBarOpen then
@@ -4027,9 +4085,11 @@ characterPanel.Interactions.Rejoin.Interact.MouseButton1Click:Connect(rejoin)
 characterPanel.Interactions.Serverhop.Interact.MouseButton1Click:Connect(serverhop)
 
 homeContainer.Interactions.Server.JobId.Interact.MouseButton1Click:Connect(function()
-	if setclipboard then 
+	if originalSetClipboard then
+		-- placeName is resolved once at startup. This used to call GetProductInfo inline, which
+		-- yields and throws when rate-limited, from inside a click handler.
 		originalSetClipboard([[
--- This script will teleport you to ' ]]..game:GetService("MarketplaceService"):GetProductInfo(placeId).Name..[['
+-- This script will teleport you to ' ]]..(placeName or "this experience")..[['
 -- If it doesn't work after a few seconds, try going into the same game, and then run the script to join ]]..localPlayer.DisplayName.. [['s specific server
 
 game:GetService("TeleportService"):TeleportToPlaceInstance(']]..placeId..[[', ']]..jobId..[[')]]
@@ -4041,7 +4101,7 @@ game:GetService("TeleportService"):TeleportToPlaceInstance(']]..placeId..[[', ']
 end)
 
 homeContainer.Interactions.Discord.Interact.MouseButton1Click:Connect(function()
-	if setclipboard then 
+	if originalSetClipboard then
 		originalSetClipboard("https://sirius.menu/discord")
 		queueNotification("Discord Invite Copied", "We've set your clipboard to the Sirius discord invite.", 4335479121)
 	else
@@ -4135,6 +4195,32 @@ for _, button in ipairs(smartBar.Buttons:GetChildren()) do
 	end
 end
 
+-- Enum.KeyCode[name] throws on an unknown or nil name. A cleared keybind stores nil, so the two
+-- unguarded lookups at the bottom of InputBegan used to throw on *every* keypress, taking out
+-- all keybinds, the smartBar toggle and ScriptSearch with them.
+local function keyCodeFromName(name)
+	if type(name) ~= "string" or name == "" then return nil end
+	local success, keyCode = pcall(function() return Enum.KeyCode[name] end)
+	return success and keyCode or nil
+end
+
+-- Shared by the grid buttons and the keybinds so both paths animate identically
+local function applyActionVisual(action, object)
+	if not (action and object) then return end
+
+	if action.enabled then
+		object.Icon.Image = "rbxassetid://"..action.images[1]
+		tweenService:Create(object, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {BackgroundTransparency = 0.1}):Play()
+		tweenService:Create(object.UIStroke, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Transparency = 1}):Play()
+		tweenService:Create(object.Icon, TweenInfo.new(0.45, Enum.EasingStyle.Quint), {ImageTransparency = 0.1}):Play()
+	else
+		object.Icon.Image = "rbxassetid://"..action.images[2]
+		tweenService:Create(object, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.55}):Play()
+		tweenService:Create(object.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {Transparency = 0.4}):Play()
+		tweenService:Create(object.Icon, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {ImageTransparency = 0.5}):Play()
+	end
+end
+
 userInputService.InputBegan:Connect(function(input, processed)
 	if not checkSirius() then return end
 
@@ -4151,58 +4237,44 @@ userInputService.InputBegan:Connect(function(input, processed)
 		return
 	end
 
+	if processed then return end
+
 	for _, category in ipairs(siriusSettings) do
 		for _, setting in ipairs(category.categorySettings) do
-			if setting.settingType == "Key" then
-				if setting.current ~= nil and setting.current ~= "" then
-					if input.KeyCode == Enum.KeyCode[setting.current] and not processed then
-						if setting.callback then
-							task.spawn(setting.callback)
+			if setting.settingType == "Key" and setting.callback and input.KeyCode == keyCodeFromName(setting.current) then
+				task.spawn(setting.callback)
 
-							local action = checkAction(setting.name) or nil
-							if action then
-								local object = action.object
-								action = action.action
+				-- Resolved by index rather than by matching the setting name against the action
+				-- name; two of them never matched and threw here instead of updating the button.
+				local action = setting.actionIndex and siriusValues.actions[setting.actionIndex]
+				local object = actionButton(action)
 
-								if action.enabled then
-									object.Icon.Image = "rbxassetid://"..action.images[1]
-									tweenService:Create(object, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {BackgroundTransparency = 0.1}):Play()
-									tweenService:Create(object.UIStroke, TweenInfo.new(0.6, Enum.EasingStyle.Quint), {Transparency = 1}):Play()
-									tweenService:Create(object.Icon, TweenInfo.new(0.45, Enum.EasingStyle.Quint), {ImageTransparency = 0.1}):Play()
+				if action and object then
+					applyActionVisual(action, object)
 
-									if action.disableAfter then
-										task.delay(action.disableAfter, function()
-											action.enabled = false
-											object.Icon.Image = "rbxassetid://"..action.images[2]
-											tweenService:Create(object, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.55}):Play()
-											tweenService:Create(object.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {Transparency = 0.4}):Play()
-											tweenService:Create(object.Icon, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {ImageTransparency = 0.5}):Play()
-										end)
-									end
+					if action.enabled and action.disableAfter then
+						task.delay(action.disableAfter, function()
+							action.enabled = false
+							applyActionVisual(action, object)
+						end)
+					end
 
-									if action.rotateWhileEnabled then
-										repeat
-											object.Icon.Rotation = 0
-											tweenService:Create(object.Icon, TweenInfo.new(0.75, Enum.EasingStyle.Quint), {Rotation = 360}):Play()
-											task.wait(1)
-										until not action.enabled
-										object.Icon.Rotation = 0
-									end
-								else
-									object.Icon.Image = "rbxassetid://"..action.images[2]
-									tweenService:Create(object, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.55}):Play()
-									tweenService:Create(object.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {Transparency = 0.4}):Play()
-									tweenService:Create(object.Icon, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {ImageTransparency = 0.5}):Play()
-								end
-							end
-						end
+					if action.enabled and action.rotateWhileEnabled then
+						task.spawn(function()
+							repeat
+								object.Icon.Rotation = 0
+								tweenService:Create(object.Icon, TweenInfo.new(0.75, Enum.EasingStyle.Quint), {Rotation = 360}):Play()
+								task.wait(1)
+							until not action.enabled or not checkSirius()
+							object.Icon.Rotation = 0
+						end)
 					end
 				end
 			end
 		end
 	end
 
-	if input.KeyCode == Enum.KeyCode[checkSetting("Open ScriptSearch").current] and not processed and not debounce then
+	if input.KeyCode == keyCodeFromName(settingValue("Open ScriptSearch")) and not debounce then
 		if scriptSearch.Visible then
 			closeScriptSearch()
 		else
@@ -4210,8 +4282,8 @@ userInputService.InputBegan:Connect(function(input, processed)
 		end
 	end
 
-	if input.KeyCode == Enum.KeyCode[checkSetting("Toggle smartBar").current] and not processed and not debounce then
-		if smartBarOpen then 
+	if input.KeyCode == keyCodeFromName(settingValue("Toggle smartBar")) and not debounce then
+		if smartBarOpen then
 			closeSmartBar()
 		else
 			openSmartBar()
@@ -4219,10 +4291,11 @@ userInputService.InputBegan:Connect(function(input, processed)
 	end
 end)
 
-userInputService.InputEnded:Connect(function(input, processed)
+userInputService.InputEnded:Connect(function(input)
 	if not checkSirius() then return end
 
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+	-- Touch releases end a drag too; MouseButton1 alone left sliders stuck active on mobile
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		for _, slider in pairs(siriusValues.sliders) do
 			slider.active = false
 
@@ -4256,9 +4329,8 @@ scriptSearch.SearchBox.FocusLost:Connect(function(enterPressed)
 
 	if #scriptSearch.SearchBox.Text > 0 then
 		if enterPressed then
-			local success, response = pcall(function()
-				searchScriptBlox(scriptSearch.SearchBox.Text)
-			end)
+			-- searchScriptBlox reports its own failures through queueNotification
+			pcall(searchScriptBlox, scriptSearch.SearchBox.Text)
 		end
 	else
 		closeScriptSearch()
@@ -4272,7 +4344,13 @@ scriptSearch.SearchBox.Focused:Connect(function()
 	end
 end)
 
-mouse.Move:Connect(function()
+-- Was Mouse.Move, which is deprecated and never fires for touch input - sliders simply didn't
+-- work on mobile. InputChanged covers mouse movement and touch drags alike.
+userInputService.InputChanged:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+
 	for _, slider in pairs(siriusValues.sliders) do
 		if slider.active then
 			updateSlider(slider)
@@ -4283,7 +4361,7 @@ end)
 userInputService.WindowFocusReleased:Connect(function() windowFocusChanged(false) end)
 userInputService.WindowFocused:Connect(function() windowFocusChanged(true) end)
 
-for index, player in ipairs(players:GetPlayers()) do
+for _, player in ipairs(players:GetPlayers()) do
 	createPlayer(player)
 	createEsp(player)
 	player.Chatted:Connect(function(message) onChatted(player, message) end)
@@ -4297,70 +4375,54 @@ players.PlayerAdded:Connect(function(player)
 
 	player.Chatted:Connect(function(message) onChatted(player, message) end)
 
-	if checkSetting("Log PlayerAdded and PlayerRemoving").current then
-		local logData = {
+	if settingValue("Log PlayerAdded and PlayerRemoving") then
+		postWebhook(settingValue("Player Added and Removing Webhook URL"), {
 			["content"] = player.DisplayName.." (@"..player.Name..") joined the server.",
 			["avatar_url"] = "https://www.roblox.com/headshot-thumbnail/image?userId="..player.UserId.."&width=420&height=420&format=png",
 			["username"] = player.DisplayName,
 			["allowed_mentions"] = {parse = {}}
-		}
-
-		logData = httpService:JSONEncode(logData)
-
-		pcall(function()
-			local req = originalRequest({
-				Url = checkSetting("Player Added and Removing Webhook URL").current,
-				Method = 'POST',
-				Headers = {
-					['Content-Type'] = 'application/json',
-				},
-				Body = logData
-			})
-		end)
-
+		})
 	end
 
-	if checkSetting("Moderator Detection").current and Pro then
-		local roleFound = player:GetRoleInGroup(creatorId)
+	-- GetRoleInGroup used to run on every join in every experience, group-owned or not: it's a
+	-- yielding web call, it sat above the friend check, and an error here silently swallowed the
+	-- rest of this handler. Now it only runs where a group role can actually exist, off-thread.
+	if settingValue("Moderator Detection") and siriusValues.currentCreator == "group" then
+		task.spawn(function()
+			local roleSuccess, roleFound = pcall(player.GetRoleInGroup, player, creatorId)
+			if not roleSuccess or type(roleFound) ~= "string" then return end
 
-		if siriusValues.currentCreator == "group" then
-			for _, role in pairs(siriusValues.administratorRoles) do 
-				if string.find(string.lower(roleFound), role) then
+			for _, role in ipairs(siriusValues.administratorRoles) do
+				if string.find(string.lower(roleFound), role, 1, true) then
 					promptModerator(player, roleFound)
-					queueNotification("Administrator Joined", siriusValues.currentGroup .." "..roleFound.." ".. player.DisplayName .." has joined your session", 3944670656) -- change to group name
+					queueNotification("Administrator Joined", roleFound.." "..player.DisplayName.." has joined your session", 3944670656)
+					break -- a role matching two keywords used to fire two prompts and two toasts
 				end
 			end
-		end
+		end)
 	end
 
-	if checkSetting("Friend Notifications").current then
-		if localPlayer:IsFriendsWith(player.UserId) then
+	if settingValue("Friend Notifications") then
+		local friendSuccess, isFriend = pcall(localPlayer.IsFriendsWith, localPlayer, player.UserId)
+		if friendSuccess and isFriend then
 			queueNotification("Friend Joined", "Your friend "..player.DisplayName.." has joined your server.", 4370335364)
 		end
 	end
 end)
 
 players.PlayerRemoving:Connect(function(player)
-	if checkSetting("Log PlayerAdded and PlayerRemoving").current then
-		local logData = {
+	if settingValue("Log PlayerAdded and PlayerRemoving") then
+		postWebhook(settingValue("Player Added and Removing Webhook URL"), {
 			["content"] = player.DisplayName.." (@"..player.Name..") left the server.",
 			["avatar_url"] = "https://www.roblox.com/headshot-thumbnail/image?userId="..player.UserId.."&width=420&height=420&format=png",
 			["username"] = player.DisplayName,
 			["allowed_mentions"] = {parse = {}}
-		}
+		})
+	end
 
-		logData = httpService:JSONEncode(logData)
-
-		pcall(function()
-			local req = originalRequest({
-				Url = checkSetting("Player Added and Removing Webhook URL").current,
-				Method = 'POST',
-				Headers = {
-					['Content-Type'] = 'application/json',
-				},
-				Body = logData
-			})
-		end)
+	-- Stop spectating someone who just left, otherwise the camera is stuck on a dead subject
+	if spectating == player then
+		restoreCamera()
 	end
 
 	removePlayer(player)
@@ -4390,29 +4452,73 @@ runService.RenderStepped:Connect(function(frame)
 	end
 end)
 
-runService.Stepped:Connect(function()
-	if not checkSirius() then return end
+-- The character's BasePart list is cached and maintained by events rather than rebuilt with
+-- GetDescendants() on every physics step (~60x/sec, whether or not noclip was even on).
+-- noclipDefaults was also keyed by part and never cleared, so it pinned a fresh set of dead part
+-- references on every respawn.
+local characterParts = {}
+local characterPartConnections = {}
 
-	local character = localPlayer.Character
-	if character then
-		-- No Clip
-		local noclipEnabled = siriusValues.actions[1].enabled
-		local flingEnabled = siriusValues.actions[6].enabled
+local function clearCharacterPartTracking()
+	for _, connection in ipairs(characterPartConnections) do
+		connection:Disconnect()
+	end
+	table.clear(characterPartConnections)
+	table.clear(characterParts)
+	table.clear(noclipDefaults)
+end
 
-		for _, part in ipairs(character:GetDescendants()) do
-			if part:IsA("BasePart") then
-				if noclipDefaults[part] == nil then
-					noclipDefaults[part] = part.CanCollide -- capture before any toggle can race in
-				end
-				if noclipEnabled or flingEnabled then
-					part.CanCollide = false
-				else
-					part.CanCollide = noclipDefaults[part]
-				end
+local function trackCharacterParts(character)
+	clearCharacterPartTracking()
+	if not character then return end
+
+	local function add(part)
+		if part:IsA("BasePart") then
+			characterParts[part] = true
+			if noclipDefaults[part] == nil then
+				noclipDefaults[part] = part.CanCollide
 			end
 		end
 	end
-end)
+
+	for _, descendant in ipairs(character:GetDescendants()) do
+		add(descendant)
+	end
+
+	table.insert(characterPartConnections, character.DescendantAdded:Connect(add))
+	table.insert(characterPartConnections, character.DescendantRemoving:Connect(function(part)
+		characterParts[part] = nil
+		noclipDefaults[part] = nil
+	end))
+end
+
+trackCharacterParts(localPlayer.Character)
+track(localPlayer.CharacterAdded:Connect(trackCharacterParts))
+track(localPlayer.CharacterRemoving:Connect(clearCharacterPartTracking))
+
+local noclipWasActive = false
+
+track(runService.Stepped:Connect(function()
+	if not checkSirius() then return end
+
+	local noclipActive = siriusValues.actions[1].enabled or siriusValues.actions[6].enabled
+
+	-- Only write CanCollide while noclip is on, plus once on the trailing edge to restore
+	if not noclipActive and not noclipWasActive then return end
+
+	for part in pairs(characterParts) do
+		if part.Parent then
+			if noclipActive then
+				part.CanCollide = false
+			else
+				local default = noclipDefaults[part]
+				part.CanCollide = if default == nil then true else default
+			end
+		end
+	end
+
+	noclipWasActive = noclipActive
+end))
 
 runService.Heartbeat:Connect(function()
 	if not checkSirius() then return end
@@ -4497,11 +4603,11 @@ local anonymousTickCounter = 0
 local anonymousWasEnabled = false
 local ANONYMOUS_TICK_INTERVAL = 15 -- run roughly 4x/sec instead of every frame
 
-runService.Heartbeat:Connect(function(frame)
+runService.Heartbeat:Connect(function()
 	if not checkSirius() then return end
 	if Pro then
-		if checkSetting("Spatial Shield").current and tonumber(checkSetting("Spatial Shield Threshold").current) then
-			local threshold = tonumber(checkSetting("Spatial Shield Threshold").current)
+		if settingValue("Spatial Shield") and tonumber(settingValue("Spatial Shield Threshold")) then
+			local threshold = tonumber(settingValue("Spatial Shield Threshold"))
 			-- iterate backwards so table.remove doesn't skip entries
 			for i = #soundInstances, 1, -1 do
 				local sound = soundInstances[i]
@@ -4532,7 +4638,7 @@ runService.Heartbeat:Connect(function(frame)
 		end
 	end
 
-	local anonymousEnabled = checkSetting("Anonymous Client").current
+	local anonymousEnabled = settingValue("Anonymous Client")
 
 	if anonymousEnabled then
 		-- Throttle: do the scan on every Nth heartbeat rather than every frame.
@@ -4544,6 +4650,7 @@ runService.Heartbeat:Connect(function(frame)
 				local text = cachedText[i]
 				if not text or not text.Parent then
 					-- Drop destroyed/orphaned labels so we stop scanning them.
+					trackedText[text] = nil
 					table.remove(cachedText, i)
 				elseif originalTextValues[text] == nil then
 					-- Only inspect labels we haven't already anonymized.
@@ -4551,8 +4658,11 @@ runService.Heartbeat:Connect(function(frame)
 					local lowerText = string.lower(raw)
 					if string.find(lowerText, lowerName, 1, true) or string.find(lowerText, lowerDisplayName, 1, true) then
 						storeOriginalText(text)
-						local newText = string.gsub(string.gsub(lowerText, lowerName, randomUsername), lowerDisplayName, randomUsername)
-						text.Text = string.gsub(newText, "^%l", string.upper)
+						-- Case-preserving and pattern-safe. The old version lowercased the whole
+						-- label, restored only the first character's case, and passed the raw
+						-- names to gsub as patterns - so a display name containing -, . or %
+						-- either mismatched or errored outright.
+						text.Text = replacePlain(replacePlain(raw, lowerName, randomUsername), lowerDisplayName, randomUsername)
 					end
 				end
 			end
@@ -4566,86 +4676,178 @@ runService.Heartbeat:Connect(function(frame)
 	anonymousWasEnabled = anonymousEnabled
 end)
 
-for _, instance in next, game:GetDescendants() do
-	if instance:IsA("Sound") then
-		if suppressedSounds[instance.SoundId] then
-			if suppressedSounds[instance.SoundId] == "S" then
-				instance.Volume = 0.5
-			elseif suppressedSounds[instance.SoundId] == "S2" then
-				instance.Volume = 0.1
-			else
-				instance.Volume = 0
-			end
-		else
-			if not table.find(cachedIds, instance.SoundId) then
-				table.insert(soundInstances, instance)
-				table.insert(cachedIds, instance.SoundId)
-			end
-		end
-	elseif instance:IsA("TextLabel") or instance:IsA("TextButton") then
-		if not table.find(cachedText, instance) then
-			table.insert(cachedText, instance)
-		end
+-- Descendant tracking.
+--
+-- Two things changed here. Membership is now a hash-set lookup instead of table.find, which was
+-- a linear scan run against every instance the experience ever created - quadratic over a
+-- session on a busy game. And registration is gated on whether a consumer is actually switched
+-- on, so a player with Spatial Shield and Anonymous Client off pays nothing at all.
+local function spatialShieldWanted()
+	return Pro and settingValue("Spatial Shield") == true
+end
+
+local function anonymousWanted()
+	return settingValue("Anonymous Client") == true
+end
+
+local function registerSound(instance)
+	local suppression = suppressedSounds[instance.SoundId]
+	if suppression then
+		instance.Volume = (suppression == "S" and 0.5) or (suppression == "S2" and 0.1) or 0
+		return
+	end
+
+	if not spatialShieldWanted() then return end
+	if trackedSounds[instance] then return end
+
+	-- Keyed by SoundId as before, so one entry per distinct asset rather than per instance
+	if not cachedIds[instance.SoundId] then
+		cachedIds[instance.SoundId] = true
+		trackedSounds[instance] = true
+		table.insert(soundInstances, instance)
 	end
 end
 
-descendantAddedConn = game.DescendantAdded:Connect(function(instance)
-	if checkSirius() then
-		if instance:IsA("Sound") then
-			if suppressedSounds[instance.SoundId] then
-				if suppressedSounds[instance.SoundId] == "S" then
-					instance.Volume = 0.5
-				elseif suppressedSounds[instance.SoundId] == "S2" then
-					instance.Volume = 0.1
-				else
-					instance.Volume = 0
-				end
-			else
-				if not table.find(cachedIds, instance.SoundId) then
-					table.insert(soundInstances, instance)
-					table.insert(cachedIds, instance.SoundId)
-				end
-			end
-		elseif instance:IsA("TextLabel") or instance:IsA("TextButton") then
-			if not table.find(cachedText, instance) then
-				table.insert(cachedText, instance)
-			end
-		end
-	end
-end)
+local function registerText(instance)
+	if not anonymousWanted() then return end
+	if trackedText[instance] then return end
 
+	trackedText[instance] = true
+	table.insert(cachedText, instance)
+end
+
+local function registerDescendant(instance)
+	if instance:IsA("Sound") then
+		registerSound(instance)
+	elseif instance:IsA("TextLabel") or instance:IsA("TextButton") then
+		registerText(instance)
+	end
+end
+
+-- The initial sweep walks the entire DataModel, so only do it when something needs the results
+if spatialShieldWanted() or anonymousWanted() then
+	task.spawn(function()
+		for _, instance in ipairs(game:GetDescendants()) do
+			pcall(registerDescendant, instance)
+		end
+	end)
+end
+
+descendantAddedConn = track(game.DescendantAdded:Connect(function(instance)
+	if not checkSirius() then return end
+	pcall(registerDescendant, instance)
+end))
+
+track(game.DescendantRemoving:Connect(function(instance)
+	trackedSounds[instance] = nil
+	trackedText[instance] = nil
+end))
+
+-- Turning either feature on mid-session backfills what was skipped while it was off
+local descendantSweepPending = false
+local function refreshDescendantTracking()
+	if descendantSweepPending then return end
+	descendantSweepPending = true
+
+	task.spawn(function()
+		for _, instance in ipairs(game:GetDescendants()) do
+			pcall(registerDescendant, instance)
+		end
+		descendantSweepPending = false
+	end)
+end
+
+
+-- Teardown. The old exit path only released the ESP folder, the DescendantAdded hook and the
+-- anonymous text; the per-frame connections, the blur, the FPS cap, the muted volume and any
+-- CanCollide overrides were all left behind.
+local function teardown()
+	if espContainer then espContainer:Destroy() end
+
+	if descendantAddedConn then descendantAddedConn:Disconnect() descendantAddedConn = nil end
+
+	for player, conn in pairs(espConnections) do
+		conn:Disconnect()
+		espConnections[player] = nil
+	end
+
+	for _, connection in ipairs(connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	table.clear(connections)
+
+	clearCharacterPartTracking()
+	undoAnonymousChanges()
+	table.clear(originalTextValues)
+
+	pcall(restoreCamera)
+	pcall(removeReverbs, 0.1)
+	pcall(blurSignature, false)
+
+	-- Put back everything Sirius changed globally
+	if setFpsCap then pcall(setFpsCap, 240) end
+	pcall(function() gameSettings.MasterVolume = oldVolume end)
+	pcall(function() camera.FieldOfView = baseFieldOfView end)
+
+	for _, coreUI in ipairs(env.cachedCoreUI or {}) do
+		pcall(starterGui.SetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI], true)
+	end
+
+	for _, cachedUI in ipairs(env.cachedInGameUI or {}) do
+		pcall(function() if cachedUI.Parent then cachedUI.Enabled = true end end)
+	end
+end
+
+local lastAnonymousWanted = anonymousWanted()
+local lastSpatialWanted = spatialShieldWanted()
 
 while task.wait(1) do
 	if not checkSirius() then
-		if espContainer then espContainer:Destroy() end
-		if descendantAddedConn then descendantAddedConn:Disconnect() descendantAddedConn = nil end
-		for player, conn in pairs(espConnections) do
-			conn:Disconnect()
-			espConnections[player] = nil
-		end
-		undoAnonymousChanges()
+		teardown()
 		break
 	end
+
+	-- A single throw in here used to end the loop permanently: no clock, no Home refresh, no
+	-- anti-idle, no latency or FPS warnings, and no disconnect detection for the rest of the
+	-- session - with the interface still on screen looking perfectly healthy.
+	local tickSuccess, tickError = pcall(function()
 
 	smartBar.Time.Text = os.date("%H")..":"..os.date("%M")
 	task.spawn(UpdateHome)
 
-	if getconnections then
-		for _, connection in getconnections(localPlayer.Idled) do
-			if not checkSetting("Anti Idle").current then connection:Enable() else connection:Disable() end
-		end
+	-- Backfill tracking when either consumer is switched on mid-session
+	local anonymousNow, spatialNow = anonymousWanted(), spatialShieldWanted()
+	if (anonymousNow and not lastAnonymousWanted) or (spatialNow and not lastSpatialWanted) then
+		refreshDescendantTracking()
+	end
+	lastAnonymousWanted, lastSpatialWanted = anonymousNow, spatialNow
+
+	if getConnectionsFor then
+		local antiIdle = settingValue("Anti Idle")
+		pcall(function()
+			for _, connection in getConnectionsFor(localPlayer.Idled) do
+				if antiIdle then connection:Disable() else connection:Enable() end
+			end
+		end)
 	end
 
-	toggle.Visible = not checkSetting("Hide Toggle Button").current
+	toggle.Visible = not settingValue("Hide Toggle Button")
 
 	-- Disconnected Check
-	local disconnectedRobloxUI = coreGui.RobloxPromptGui.promptOverlay:FindFirstChild("ErrorPrompt")
+	-- These were hard indexes. RobloxPromptGui/promptOverlay aren't guaranteed to exist, and a
+	-- miss threw straight out of the loop.
+	local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
+	local promptOverlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+	local disconnectedRobloxUI = promptOverlay and promptOverlay:FindFirstChild("ErrorPrompt")
 
 	if disconnectedRobloxUI and not promptedDisconnected then
-		local reasonPrompt = disconnectedRobloxUI.MessageArea.ErrorFrame.ErrorMessage.Text
+		local messageArea = disconnectedRobloxUI:FindFirstChild("MessageArea")
+		local errorFrame = messageArea and messageArea:FindFirstChild("ErrorFrame")
+		local errorMessage = errorFrame and errorFrame:FindFirstChild("ErrorMessage")
+		local reasonPrompt = errorMessage and errorMessage.Text or ""
 
 		promptedDisconnected = true
-		disconnectedPrompt.Parent = coreGui.RobloxPromptGui
+		disconnectedPrompt.Parent = promptGui
 
 		local disconnectType
 		local foundString
@@ -4702,9 +4904,9 @@ while task.wait(1) do
 
 		disconnectedPrompt.Action.MouseButton1Click:Connect(function()
 			if disconnectType == "ban" then
-				game:Shutdown() -- leave
+				leaveExperience()
 			elseif disconnectType == "kick" then
-				serverhop()
+				task.spawn(serverhop)
 			elseif disconnectType == "network" then
 				rejoin()
 			end
@@ -4717,7 +4919,7 @@ while task.wait(1) do
 		-- Two-Way Adaptive Latency Checks
 		if checkHighPing() then
 			if siriusValues.pingProfile.pingNotificationCooldown <= 0 then
-				if checkSetting("Adaptive Latency Warning").current then
+				if settingValue("Adaptive Latency Warning") then
 					queueNotification("High Latency Warning","We've noticed your latency has reached a higher value than usual, you may find that you are lagging or your actions are delayed in-game. Consider checking for any background downloads on your machine.", 4370305588)
 					siriusValues.pingProfile.pingNotificationCooldown = 120
 				end
@@ -4734,9 +4936,9 @@ while task.wait(1) do
 				local avgFPS = siriusValues.frameProfile.totalFPS / #siriusValues.frameProfile.fpsQueue
 
 				if avgFPS < siriusValues.frameProfile.lowFPSThreshold then
-					if checkSetting("Adaptive Performance Warning").current then
+					if settingValue("Adaptive Performance Warning") then
 						queueNotification("Degraded Performance","We've noticed your client's frames per second have decreased. Consider checking for any background tasks or programs on your machine.", 4384400106)
-						siriusValues.frameProfile.frameNotificationCooldown = 120	
+						siriusValues.frameProfile.frameNotificationCooldown = 120
 					end
 				end
 			end
@@ -4745,5 +4947,11 @@ while task.wait(1) do
 		if siriusValues.frameProfile.frameNotificationCooldown > 0 then
 			siriusValues.frameProfile.frameNotificationCooldown -= 1
 		end
+	end
+
+	end) -- end of the per-tick pcall
+
+	if not tickSuccess then
+		warn("Sirius | Error in the update loop (recovering): "..tostring(tickError))
 	end
 end

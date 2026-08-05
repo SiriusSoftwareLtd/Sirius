@@ -1,0 +1,88 @@
+---
+# Selene standard library for Sirius: the Roblox std plus the executor globals Sirius
+# feature-detects at startup. Every one of these is optional at runtime.
+base: roblox
+name: sirius
+
+globals:
+  identifyexecutor:
+    args:
+      - required: false
+        type: any
+  setfpscap:
+    args:
+      - type: number
+  getcustomasset:
+    args:
+      - type: string
+  getgenv:
+    args: []
+  gethui:
+    args: []
+  cloneref:
+    args:
+      - type: any
+  getconnections:
+    args:
+      - type: any
+  hookmetamethod:
+    args:
+      - type: any
+      - type: string
+      - type: function
+  getnamecallmethod:
+    args: []
+  setclipboard:
+    args:
+      - type: string
+  request:
+    args:
+      - type: table
+  http_request:
+    args:
+      - type: table
+  http.request:
+    args:
+      - type: table
+  syn.request:
+    args:
+      - type: table
+  syn.protect_gui:
+    args:
+      - type: any
+  fluxus.request:
+    args:
+      - type: table
+  writefile:
+    args:
+      - type: string
+      - type: string
+  readfile:
+    args:
+      - type: string
+  appendfile:
+    args:
+      - type: string
+      - type: string
+  isfile:
+    args:
+      - type: string
+  delfile:
+    args:
+      - type: string
+  listfiles:
+    args:
+      - type: string
+  makefolder:
+    args:
+      - type: string
+  isfolder:
+    args:
+      - type: string
+  delfolder:
+    args:
+      - type: string
+  script_key:
+    property: read-only
+  Essential:
+    property: read-only

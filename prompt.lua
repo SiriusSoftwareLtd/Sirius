@@ -79,7 +79,23 @@ end
 
 
 function promptRet.create(title, description, primary, secondary, callback)
-	local prompt = useStudio and script.Parent:FindFirstChild('WarningPrompt') or game:GetObjects("rbxassetid://76963332287827")[1]
+	-- GetObjects is executor-only and can fail; returning nil is better than throwing into the
+	-- caller, which had no guard of its own.
+	local loadSuccess, prompt = pcall(function()
+		if useStudio then
+			return script.Parent:FindFirstChild('WarningPrompt')
+		end
+		return game:GetObjects("rbxassetid://76963332287827")[1]
+	end)
+
+	if not loadSuccess or not prompt then
+		warn("Sirius | Unable to load the warning prompt: " .. tostring(prompt))
+		if callback then callback(false) end
+		return
+	end
+
+	fin = false
+	debounce = false
 
 	prompt.Enabled = false
 
@@ -117,15 +133,25 @@ function promptRet.create(title, description, primary, secondary, callback)
 	prompt.Policy.Actions.Primary.Title.Text = primary
 	prompt.Policy.Actions.Secondary.Title.Text = secondary
 	
-	-- Handle the button clicks and trigger the callback
-	prompt.Policy.Actions.Primary.Interact.MouseButton1Click:Connect(function()
+	-- Handle the button clicks and trigger the callback.
+	-- `answered` guards against a second click landing during the close animation, which would
+	-- invoke the callback twice and call :Destroy() on an already-destroyed prompt.
+	local answered = false
+
+	local function answer(value)
+		if answered then return end
+		answered = true
+
 		close(prompt)
-		if callback then callback(true) end
+		if callback then callback(value) end
+	end
+
+	prompt.Policy.Actions.Primary.Interact.MouseButton1Click:Connect(function()
+		answer(true)
 	end)
 
 	prompt.Policy.Actions.Secondary.Interact.MouseButton1Click:Connect(function()
-		close(prompt)
-		if callback then callback(false) end
+		answer(false)
 	end)
 	
 	prompt.Policy.Actions.Primary.Interact.MouseEnter:Connect(function()

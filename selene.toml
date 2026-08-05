@@ -1,0 +1,19 @@
+# sirius.yml chains base: roblox, adding the executor globals we feature-detect.
+# CI generates roblox.yml via `selene generate-roblox-std` before linting.
+std = "sirius"
+
+[lints]
+# Executor globals are intentionally read in boolean context before use.
+global_usage = "allow"
+# Shadowing is deliberate in a few handlers (local success, response = pcall(...)).
+shadowing = "allow"
+# One-liner `if x then ... end` is the house style throughout this file.
+multiple_statements = "allow"
+# UDim2.new with explicit scale+offset is used deliberately; not always convertible.
+roblox_manual_fromscale_or_fromoffset = "allow"
+mixed_table = "allow"
+# lint regenerates the roblox std from Roblox's live API each run, so their deprecation
+# flags drift under us. KeyCode.Unknown is our unbound sentinel and stays valid at runtime.
+deprecated = "allow"
+# game:HttpGet is an executor extension to DataModel and isn't in Roblox's API dump.
+incorrect_standard_library_use = "allow"
