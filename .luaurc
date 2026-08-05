@@ -1,6 +1,13 @@
 {
     "languageMode": "nonstrict",
     "lintErrors": true,
+    "lint": {
+        "*": true,
+        // Several handlers return early on a guard and fall through otherwise; that's intended.
+        "ImplicitReturn": false,
+        // if/else branches that animate to the same value are deliberate in the tween code.
+        "DuplicateCondition": false
+    },
     "globals": [
         "writefile",
         "readfile",

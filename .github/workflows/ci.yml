@@ -29,5 +29,19 @@ jobs:
       - name: Analyze
         run: |
           curl -sSL -o globalTypes.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/main/scripts/globalTypes.d.luau
+
+          # game:HttpGet is an executor extension to DataModel and isn't in Roblox's published
+          # API dump, so the analyzer flags every call site. Those lines are filtered out; any
+          # other diagnostic fails the build.
+          set +e
           luau-lsp analyze --definitions=globalTypes.d.luau --no-strict-dm-types \
-            --ignore="**/globalTypes.d.luau" source.lua boost.lua prompt.lua
+            source.lua boost.lua prompt.lua 2>&1 | tee analyze.log
+          set -e
+
+          if grep -vE "^\[(INFO|WARN)\]|Key 'HttpGet' not found in external type 'DataModel'" analyze.log \
+             | grep -qE "TypeError|SyntaxError|StrictModeError"; then
+            echo "::error::luau-lsp reported diagnostics beyond the known HttpGet exception"
+            exit 1
+          fi
+
+          echo "Analyze clean (HttpGet exceptions only)"

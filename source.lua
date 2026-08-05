@@ -886,7 +886,8 @@ end
 -- In Studio there's no GetObjects, so the interface is expected to sit next to this script.
 local uiSuccess, uiResult = pcall(function()
 	if useStudio then
-		return script.Parent:FindFirstChild(siriusValues.siriusName)
+		local container = script.Parent
+		return container and container:FindFirstChild(siriusValues.siriusName)
 	end
 	return game:GetObjects("rbxassetid://" .. siriusValues.interfaceAsset)[1]
 end)
@@ -4520,7 +4521,9 @@ track(userInputService.InputBegan:Connect(function(input, processed)
 	end
 
 	if checkingForKey then
-		if input.KeyCode ~= Enum.KeyCode.Unknown then
+		-- Compared by name: Roblox's published API dump doesn't list KeyCode.Unknown, so
+		-- referencing the member directly trips the analyzer even though it's valid at runtime.
+		if input.KeyCode.Name ~= "Unknown" then
 			local splitMessage = string.split(tostring(input.KeyCode), ".")
 			local newKeyNoEnum = splitMessage[3]
 			checkingForKey.object.InputFrame.InputBox.Text = tostring(newKeyNoEnum)

@@ -82,7 +82,8 @@ function promptRet.create(title, description, primary, secondary, callback)
 	-- caller, which had no guard of its own.
 	local loadSuccess, prompt = pcall(function()
 		if useStudio then
-			return script.Parent:FindFirstChild("WarningPrompt")
+			local container = script.Parent
+			return container and container:FindFirstChild("WarningPrompt")
 		end
 		return game:GetObjects("rbxassetid://76963332287827")[1]
 	end)
