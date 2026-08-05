@@ -4514,7 +4514,7 @@ local function applyActionVisual(action, object)
 	end
 end
 
-userInputService.InputBegan:Connect(function(input, processed)
+track(userInputService.InputBegan:Connect(function(input, processed)
 	if not checkSirius() then
 		return
 	end
@@ -4586,9 +4586,9 @@ userInputService.InputBegan:Connect(function(input, processed)
 			openSmartBar()
 		end
 	end
-end)
+end))
 
-userInputService.InputEnded:Connect(function(input)
+track(userInputService.InputEnded:Connect(function(input)
 	if not checkSirius() then
 		return
 	end
@@ -4605,12 +4605,12 @@ userInputService.InputEnded:Connect(function(input)
 			end
 		end
 	end
-end)
+end))
 
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+track(camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
 	task.wait(0.5)
 	updateSliderPadding()
-end)
+end))
 
 scriptSearch.SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
 	if #scriptSearch.SearchBox.Text > 0 then
@@ -4645,7 +4645,7 @@ end)
 
 -- Was Mouse.Move, which is deprecated and never fires for touch input - sliders simply didn't
 -- work on mobile. InputChanged covers mouse movement and touch drags alike.
-userInputService.InputChanged:Connect(function(input)
+track(userInputService.InputChanged:Connect(function(input)
 	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
 		return
 	end
@@ -4655,14 +4655,14 @@ userInputService.InputChanged:Connect(function(input)
 			updateSlider(slider)
 		end
 	end
-end)
+end))
 
-userInputService.WindowFocusReleased:Connect(function()
+track(userInputService.WindowFocusReleased:Connect(function()
 	windowFocusChanged(false)
-end)
-userInputService.WindowFocused:Connect(function()
+end))
+track(userInputService.WindowFocused:Connect(function()
 	windowFocusChanged(true)
-end)
+end))
 
 for _, player in ipairs(players:GetPlayers()) do
 	createPlayer(player)
@@ -4672,7 +4672,7 @@ for _, player in ipairs(players:GetPlayers()) do
 	end)
 end
 
-players.PlayerAdded:Connect(function(player)
+track(players.PlayerAdded:Connect(function(player)
 	if not checkSirius() then
 		return
 	end
@@ -4719,9 +4719,9 @@ players.PlayerAdded:Connect(function(player)
 			queueNotification("Friend Joined", "Your friend " .. player.DisplayName .. " has joined your server.", 4370335364)
 		end
 	end
-end)
+end))
 
-players.PlayerRemoving:Connect(function(player)
+track(players.PlayerRemoving:Connect(function(player)
 	if settingValue("Log PlayerAdded and PlayerRemoving") then
 		postWebhook(settingValue("Player Added and Removing Webhook URL"), {
 			["content"] = player.DisplayName .. " (@" .. player.Name .. ") left the server.",
@@ -4748,9 +4748,9 @@ players.PlayerRemoving:Connect(function(player)
 	if highlight then
 		highlight:Destroy()
 	end
-end)
+end))
 
-runService.RenderStepped:Connect(function(frame)
+track(runService.RenderStepped:Connect(function(frame)
 	if not checkSirius() then
 		return
 	end
@@ -4763,7 +4763,7 @@ runService.RenderStepped:Connect(function(frame)
 		siriusValues.frameProfile.totalFPS -= siriusValues.frameProfile.fpsQueue[1]
 		table.remove(siriusValues.frameProfile.fpsQueue, 1)
 	end
-end)
+end))
 
 -- The character's BasePart list is cached and maintained by events rather than rebuilt with
 -- GetDescendants() on every physics step (~60x/sec, whether or not noclip was even on).
@@ -4842,7 +4842,7 @@ track(runService.Stepped:Connect(function()
 	noclipWasActive = noclipActive
 end))
 
-runService.Heartbeat:Connect(function()
+track(runService.Heartbeat:Connect(function()
 	if not checkSirius() then
 		return
 	end
@@ -4922,14 +4922,14 @@ runService.Heartbeat:Connect(function()
 			bodyGyro.Parent = nil
 		end
 	end
-end)
+end))
 
 -- Anonymous Client throttle/transition state
 local anonymousTickCounter = 0
 local anonymousWasEnabled = false
 local ANONYMOUS_TICK_INTERVAL = 15 -- run roughly 4x/sec instead of every frame
 
-runService.Heartbeat:Connect(function()
+track(runService.Heartbeat:Connect(function()
 	if not checkSirius() then
 		return
 	end
@@ -5002,7 +5002,7 @@ runService.Heartbeat:Connect(function()
 	end
 
 	anonymousWasEnabled = anonymousEnabled
-end)
+end))
 
 -- Descendant tracking.
 --
