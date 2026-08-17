@@ -3983,7 +3983,7 @@ local function assembleSettings()
 									"You must be " .. minimumLicense .. " or higher to use " .. setting.name .. ". \n\nUpgrade at https://sirius.menu.",
 									4483345875
 								)
-								newKeybind.InputFrame.InputBox.Text = setting.current
+								newKeybind.InputFrame.InputBox.Text = setting.current or "No Keybind"
 								return
 							end
 						end
@@ -4532,8 +4532,14 @@ track(userInputService.InputBegan:Connect(function(input, processed)
 		local keyName = keyCode and keyCode.Name
 		if keyName and keyName ~= "Unknown" then
 			local capture = checkingForKey
-			capture.object.InputFrame.InputBox.Text = keyName
-			capture.data.current = keyName
+			-- Backspace/Delete explicitly clear a bind; losing focus without a key still cancels capture.
+			if keyName == "Backspace" or keyName == "Delete" then
+				capture.object.InputFrame.InputBox.Text = "No Keybind"
+				capture.data.current = nil
+			else
+				capture.object.InputFrame.InputBox.Text = keyName
+				capture.data.current = keyName
+			end
 			checkingForKey = nil
 			capture.object.InputFrame.InputBox:ReleaseFocus()
 			saveSettings()
