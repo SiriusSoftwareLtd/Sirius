@@ -210,7 +210,7 @@ local lowerName = localPlayer.Name:lower()
 local lowerDisplayName = localPlayer.DisplayName:lower()
 local placeId = game.PlaceId
 local jobId = game.JobId
-local checkingForKey = false
+local checkingForKey
 local originalTextValues = {}
 local creatorId = game.CreatorId
 local noclipDefaults = {}
@@ -3970,7 +3970,11 @@ local function assembleSettings()
 					newKeybind.InputFrame.Size = UDim2.new(0, newKeybind.InputFrame.InputBox.TextBounds.X + 24, 0, 30)
 
 					newKeybind.InputFrame.InputBox.FocusLost:Connect(function()
-						checkingForKey = false
+						local capture = checkingForKey
+						local ownsCapture = capture and capture.object == newKeybind
+						if ownsCapture then
+							checkingForKey = nil
+						end
 
 						if minimumLicense then
 							if (minimumLicense == "Pro" and not Pro) or (minimumLicense == "Essential" and not (Pro or Essential)) then
@@ -3979,21 +3983,19 @@ local function assembleSettings()
 									"You must be " .. minimumLicense .. " or higher to use " .. setting.name .. ". \n\nUpgrade at https://sirius.menu.",
 									4483345875
 								)
-								newKeybind.InputFrame.InputBox.Text = setting.current
+								newKeybind.InputFrame.InputBox.Text = setting.current or "No Keybind"
 								return
 							end
 						end
 
 						if newKeybind.InputFrame.InputBox.Text == nil or newKeybind.InputFrame.InputBox.Text == "" then
-							newKeybind.InputFrame.InputBox.Text = "No Keybind"
-							setting.current = nil
-							newKeybind.InputFrame.InputBox:ReleaseFocus()
-							saveSettings()
+							setting.current = ownsCapture and capture.previous or setting.current
+							newKeybind.InputFrame.InputBox.Text = setting.current or "No Keybind"
 						end
 					end)
 
 					newKeybind.InputFrame.InputBox.Focused:Connect(function()
-						checkingForKey = { data = setting, object = newKeybind }
+						checkingForKey = { data = setting, object = newKeybind, previous = setting.current }
 						newKeybind.InputFrame.InputBox.Text = ""
 					end)
 
@@ -4521,14 +4523,25 @@ track(userInputService.InputBegan:Connect(function(input, processed)
 	end
 
 	if checkingForKey then
-		-- Compared by name: Roblox's published API dump doesn't list KeyCode.Unknown, so
-		-- referencing the member directly trips the analyzer even though it's valid at runtime.
-		if input.KeyCode.Name ~= "Unknown" then
-			local splitMessage = string.split(tostring(input.KeyCode), ".")
-			local newKeyNoEnum = splitMessage[3]
-			checkingForKey.object.InputFrame.InputBox.Text = tostring(newKeyNoEnum)
-			checkingForKey.data.current = tostring(newKeyNoEnum)
-			checkingForKey.object.InputFrame.InputBox:ReleaseFocus()
+		local inputType = input.UserInputType.Name
+		if inputType ~= "Keyboard" and string.find(inputType, "Gamepad", 1, true) ~= 1 then
+			return
+		end
+
+		local keyCode = input.KeyCode
+		local keyName = keyCode and keyCode.Name
+		if keyName and keyName ~= "Unknown" then
+			local capture = checkingForKey
+			-- Backspace/Delete explicitly clear a bind; losing focus without a key still cancels capture.
+			if keyName == "Backspace" or keyName == "Delete" then
+				capture.object.InputFrame.InputBox.Text = "No Keybind"
+				capture.data.current = nil
+			else
+				capture.object.InputFrame.InputBox.Text = keyName
+				capture.data.current = keyName
+			end
+			checkingForKey = nil
+			capture.object.InputFrame.InputBox:ReleaseFocus()
 			saveSettings()
 		end
 
@@ -4536,6 +4549,11 @@ track(userInputService.InputBegan:Connect(function(input, processed)
 	end
 
 	if processed then
+		return
+	end
+
+	local inputType = input.UserInputType.Name
+	if inputType ~= "Keyboard" and string.find(inputType, "Gamepad", 1, true) ~= 1 then
 		return
 	end
 
