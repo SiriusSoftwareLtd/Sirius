@@ -922,17 +922,12 @@ for attempt = 1, 3 do
 	end
 end
 
--- A bare warn goes to a console these users never open, so a failure here looked exactly
--- like Sirius not running at all -- no window, no error, nothing to report. SetCore is the
--- only surface we can reach before the interface exists.
+-- The old message named only the pcall's error value, so the empty-asset case printed
+-- "nil" and said nothing about what had gone wrong. Both causes are spelled out now, and
+-- the line says Sirius is stopping -- the previous wording read as a warning about a
+-- missing extra rather than the end of the launch.
 if not uiResult then
-	local message = "Sirius couldn't load its interface (" .. tostring(uiError) .. "). This is usually temporary, try again in a moment."
-	warn("Sirius | " .. message)
-	pcall(starterGui.SetCore, starterGui, "SendNotification", {
-		Title = "Sirius failed to start",
-		Text = message,
-		Duration = 15,
-	})
+	warn("Sirius | Couldn't load the interface asset after 3 attempts (" .. tostring(uiError) .. "). Sirius has not started.")
 	return
 end
 
