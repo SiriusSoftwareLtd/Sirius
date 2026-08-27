@@ -37,9 +37,19 @@ Potential Future Setting Options
  
 --]]
 
--- Ensure the game is loaded
+-- Ensure the game is loaded.
+--
+-- game.Loaded fires exactly once, so waiting on it after it has already fired blocks
+-- forever. IsLoaded() guards that, but the two disagree on auto-execute: the signal has
+-- gone while IsLoaded() still reads false, and Sirius stops here with no error, nothing on
+-- screen and no way for the user to tell it ever ran. Polling the flag instead cannot miss
+-- an edge, and the deadline means a client that never reports loaded costs a few seconds
+-- rather than the whole launch.
 if not game:IsLoaded() then
-	game.Loaded:Wait()
+	local deadline = os.clock() + 10
+	while not game:IsLoaded() and os.clock() < deadline do
+		task.wait()
+	end
 end
 
 -- Check License Tier
@@ -884,16 +894,45 @@ if sirius then
 end
 
 -- In Studio there's no GetObjects, so the interface is expected to sit next to this script.
-local uiSuccess, uiResult = pcall(function()
+local function loadInterface()
 	if useStudio then
 		local container = script.Parent
 		return container and container:FindFirstChild(siriusValues.siriusName)
 	end
-	return game:GetObjects("rbxassetid://" .. siriusValues.interfaceAsset)[1]
-end)
+	-- Indexing [1] directly threw its own error when the fetch came back empty, which
+	-- then read as "GetObjects is broken" rather than "the asset didn't arrive".
+	local objects = game:GetObjects("rbxassetid://" .. siriusValues.interfaceAsset)
+	return objects and objects[1]
+end
 
-if not uiSuccess or not uiResult then
-	warn("Sirius | Unable to load the interface asset: " .. tostring(uiResult))
+-- GetObjects has two distinct failure modes and they used to share one silent exit: it can
+-- throw, or it can succeed and hand back an empty table because the asset did not come down
+-- for this client. The second is transient and worth retrying; neither is worth ending the
+-- script over without telling anyone.
+local uiResult, uiError
+for attempt = 1, 3 do
+	local success, result = pcall(loadInterface)
+	if success and result then
+		uiResult = result
+		break
+	end
+	uiError = success and "the interface asset returned nothing" or tostring(result)
+	if attempt < 3 then
+		task.wait(attempt)
+	end
+end
+
+-- A bare warn goes to a console these users never open, so a failure here looked exactly
+-- like Sirius not running at all -- no window, no error, nothing to report. SetCore is the
+-- only surface we can reach before the interface exists.
+if not uiResult then
+	local message = "Sirius couldn't load its interface (" .. tostring(uiError) .. "). This is usually temporary, try again in a moment."
+	warn("Sirius | " .. message)
+	pcall(starterGui.SetCore, starterGui, "SendNotification", {
+		Title = "Sirius failed to start",
+		Text = message,
+		Duration = 15,
+	})
 	return
 end
 
