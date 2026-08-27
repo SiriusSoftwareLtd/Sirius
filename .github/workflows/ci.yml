@@ -21,6 +21,12 @@ jobs:
       - name: Check formatting
         run: stylua --check source.lua boost.lua prompt.lua
 
+      # Runs before lint and analyze because it is the one check that catches a file
+      # nobody can run. The others all passed on the 201-local source.lua that failed
+      # to compile on stricter executors and returned nil from loadstring.
+      - name: Compile
+        run: lune run compile-check.luau
+
       - name: Lint
         run: |
           selene generate-roblox-std

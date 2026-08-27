@@ -5,3 +5,7 @@
 StyLua = "JohnnyMorganz/StyLua@2.5.2"
 selene = "Kampfkarren/selene@0.31.0"
 luau-lsp = "JohnnyMorganz/luau-lsp@1.68.1"
+# Compiles the sources in CI. luau-lsp analyses, which is not the same thing: the
+# 200-locals-per-scope cap is a codegen limit, so a file that cannot compile still
+# passes format, lint and analyze. See the `do` block at the end of source.lua.
+lune = "lune-org/lune@0.8.9"
