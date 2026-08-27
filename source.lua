@@ -5059,333 +5059,346 @@ track(runService.Heartbeat:Connect(function()
 	anonymousWasEnabled = anonymousEnabled
 end))
 
--- Descendant tracking.
+-- Everything from here to the end of the file lives in its own block.
 --
--- Two things changed here. Membership is now a hash-set lookup instead of table.find, which was
--- a linear scan run against every instance the experience ever created - quadratic over a
--- session on a busy game. And registration is gated on whether a consumer is actually switched
--- on, so a player with Spatial Shield and Anonymous Client off pays nothing at all.
-local function spatialShieldWanted()
-	return Pro and settingValue("Spatial Shield") == true
-end
-
-local function anonymousWanted()
-	return settingValue("Anonymous Client") == true
-end
-
-local function registerSound(instance)
-	local suppression = suppressedSounds[instance.SoundId]
-	if suppression then
-		instance.Volume = (suppression == "S" and 0.5) or (suppression == "S2" and 0.1) or 0
-		return
+-- Luau allows 200 locals per function scope and the main chunk is one of them. This file
+-- had 201, so `lastSpatialWanted` -- the last one declared -- was rejected at compile time
+-- with "Out of local registers". loadstring() then returned nil and the caller got
+-- "attempt to call a nil value" on line 1, with nothing to say why. Newer Luau reuses
+-- registers from dead scopes and slipped under the limit; stricter executors did not, which
+-- is the whole of "it works for some people". Nothing below is referenced above it, so
+-- scoping it costs nothing and takes the chunk to 191.
+--
+-- Adding a top-level local anywhere in this file spends part of that headroom.
+do
+	-- Descendant tracking.
+	--
+	-- Two things changed here. Membership is now a hash-set lookup instead of table.find, which was
+	-- a linear scan run against every instance the experience ever created - quadratic over a
+	-- session on a busy game. And registration is gated on whether a consumer is actually switched
+	-- on, so a player with Spatial Shield and Anonymous Client off pays nothing at all.
+	local function spatialShieldWanted()
+		return Pro and settingValue("Spatial Shield") == true
 	end
 
-	if not spatialShieldWanted() then
-		return
-	end
-	if trackedSounds[instance] then
-		return
+	local function anonymousWanted()
+		return settingValue("Anonymous Client") == true
 	end
 
-	-- Keyed by SoundId as before, so one entry per distinct asset rather than per instance
-	if not cachedIds[instance.SoundId] then
-		cachedIds[instance.SoundId] = true
-		trackedSounds[instance] = true
-		table.insert(soundInstances, instance)
-	end
-end
-
-local function registerText(instance)
-	if not anonymousWanted() then
-		return
-	end
-	if trackedText[instance] then
-		return
-	end
-
-	trackedText[instance] = true
-	table.insert(cachedText, instance)
-end
-
-local function registerDescendant(instance)
-	if instance:IsA("Sound") then
-		registerSound(instance)
-	elseif instance:IsA("TextLabel") or instance:IsA("TextButton") then
-		registerText(instance)
-	end
-end
-
--- The initial sweep walks the entire DataModel, so only do it when something needs the results
-if spatialShieldWanted() or anonymousWanted() then
-	task.spawn(function()
-		for _, instance in ipairs(game:GetDescendants()) do
-			pcall(registerDescendant, instance)
+	local function registerSound(instance)
+		local suppression = suppressedSounds[instance.SoundId]
+		if suppression then
+			instance.Volume = (suppression == "S" and 0.5) or (suppression == "S2" and 0.1) or 0
+			return
 		end
-	end)
-end
 
-descendantAddedConn = track(game.DescendantAdded:Connect(function(instance)
-	if not checkSirius() then
-		return
-	end
-	pcall(registerDescendant, instance)
-end))
-
-track(game.DescendantRemoving:Connect(function(instance)
-	trackedSounds[instance] = nil
-	trackedText[instance] = nil
-end))
-
--- Turning either feature on mid-session backfills what was skipped while it was off
-local descendantSweepPending = false
-local function refreshDescendantTracking()
-	if descendantSweepPending then
-		return
-	end
-	descendantSweepPending = true
-
-	task.spawn(function()
-		for _, instance in ipairs(game:GetDescendants()) do
-			pcall(registerDescendant, instance)
+		if not spatialShieldWanted() then
+			return
 		end
-		descendantSweepPending = false
-	end)
-end
-
--- Teardown. The old exit path only released the ESP folder, the DescendantAdded hook and the
--- anonymous text; the per-frame connections, the blur, the FPS cap, the muted volume and any
--- CanCollide overrides were all left behind.
-local function teardown()
-	if espContainer then
-		espContainer:Destroy()
-	end
-
-	if descendantAddedConn then
-		descendantAddedConn:Disconnect()
-		descendantAddedConn = nil
-	end
-
-	for player, conn in pairs(espConnections) do
-		conn:Disconnect()
-		espConnections[player] = nil
-	end
-
-	for _, connection in ipairs(connections) do
-		pcall(function()
-			connection:Disconnect()
-		end)
-	end
-	table.clear(connections)
-
-	-- Restore CanCollide before dropping the cache. The Stepped handler would normally do this
-	-- on the trailing edge, but it has just been disconnected, so nothing else will.
-	pcall(function()
-		for part in pairs(characterParts) do
-			if part.Parent then
-				local default = noclipDefaults[part]
-				part.CanCollide = if default == nil then true else default
-			end
+		if trackedSounds[instance] then
+			return
 		end
-	end)
 
-	clearCharacterPartTracking()
-	undoAnonymousChanges()
-	table.clear(originalTextValues)
-
-	pcall(restoreCamera)
-	pcall(removeReverbs, 0.1)
-	pcall(blurSignature, false)
-
-	-- Put back everything Sirius changed globally
-	if setFpsCap then
-		pcall(setFpsCap, 240)
-	end
-	pcall(function()
-		gameSettings.MasterVolume = oldVolume
-	end)
-	pcall(function()
-		camera.FieldOfView = baseFieldOfView
-	end)
-
-	for _, coreUI in ipairs(env.cachedCoreUI or {}) do
-		pcall(starterGui.SetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI], true)
+		-- Keyed by SoundId as before, so one entry per distinct asset rather than per instance
+		if not cachedIds[instance.SoundId] then
+			cachedIds[instance.SoundId] = true
+			trackedSounds[instance] = true
+			table.insert(soundInstances, instance)
+		end
 	end
 
-	for _, cachedUI in ipairs(env.cachedInGameUI or {}) do
-		pcall(function()
-			if cachedUI.Parent then
-				cachedUI.Enabled = true
+	local function registerText(instance)
+		if not anonymousWanted() then
+			return
+		end
+		if trackedText[instance] then
+			return
+		end
+
+		trackedText[instance] = true
+		table.insert(cachedText, instance)
+	end
+
+	local function registerDescendant(instance)
+		if instance:IsA("Sound") then
+			registerSound(instance)
+		elseif instance:IsA("TextLabel") or instance:IsA("TextButton") then
+			registerText(instance)
+		end
+	end
+
+	-- The initial sweep walks the entire DataModel, so only do it when something needs the results
+	if spatialShieldWanted() or anonymousWanted() then
+		task.spawn(function()
+			for _, instance in ipairs(game:GetDescendants()) do
+				pcall(registerDescendant, instance)
 			end
 		end)
 	end
-end
 
-local lastAnonymousWanted = anonymousWanted()
-local lastSpatialWanted = spatialShieldWanted()
+	descendantAddedConn = track(game.DescendantAdded:Connect(function(instance)
+		if not checkSirius() then
+			return
+		end
+		pcall(registerDescendant, instance)
+	end))
 
-while task.wait(1) do
-	if not checkSirius() then
-		teardown()
-		break
+	track(game.DescendantRemoving:Connect(function(instance)
+		trackedSounds[instance] = nil
+		trackedText[instance] = nil
+	end))
+
+	-- Turning either feature on mid-session backfills what was skipped while it was off
+	local descendantSweepPending = false
+	local function refreshDescendantTracking()
+		if descendantSweepPending then
+			return
+		end
+		descendantSweepPending = true
+
+		task.spawn(function()
+			for _, instance in ipairs(game:GetDescendants()) do
+				pcall(registerDescendant, instance)
+			end
+			descendantSweepPending = false
+		end)
 	end
 
-	-- A single throw in here used to end the loop permanently: no clock, no Home refresh, no
-	-- anti-idle, no latency or FPS warnings, and no disconnect detection for the rest of the
-	-- session - with the interface still on screen looking perfectly healthy.
-	local tickSuccess, tickError = pcall(function()
-		smartBar.Time.Text = os.date("%H") .. ":" .. os.date("%M")
-		task.spawn(UpdateHome)
-
-		-- Backfill tracking when either consumer is switched on mid-session
-		local anonymousNow, spatialNow = anonymousWanted(), spatialShieldWanted()
-		if (anonymousNow and not lastAnonymousWanted) or (spatialNow and not lastSpatialWanted) then
-			refreshDescendantTracking()
+	-- Teardown. The old exit path only released the ESP folder, the DescendantAdded hook and the
+	-- anonymous text; the per-frame connections, the blur, the FPS cap, the muted volume and any
+	-- CanCollide overrides were all left behind.
+	local function teardown()
+		if espContainer then
+			espContainer:Destroy()
 		end
-		lastAnonymousWanted, lastSpatialWanted = anonymousNow, spatialNow
 
-		if getConnectionsFor then
-			local antiIdle = settingValue("Anti Idle")
+		if descendantAddedConn then
+			descendantAddedConn:Disconnect()
+			descendantAddedConn = nil
+		end
+
+		for player, conn in pairs(espConnections) do
+			conn:Disconnect()
+			espConnections[player] = nil
+		end
+
+		for _, connection in ipairs(connections) do
 			pcall(function()
-				for _, connection in getConnectionsFor(localPlayer.Idled) do
-					if antiIdle then
-						connection:Disable()
-					else
-						connection:Enable()
-					end
+				connection:Disconnect()
+			end)
+		end
+		table.clear(connections)
+
+		-- Restore CanCollide before dropping the cache. The Stepped handler would normally do this
+		-- on the trailing edge, but it has just been disconnected, so nothing else will.
+		pcall(function()
+			for part in pairs(characterParts) do
+				if part.Parent then
+					local default = noclipDefaults[part]
+					part.CanCollide = if default == nil then true else default
+				end
+			end
+		end)
+
+		clearCharacterPartTracking()
+		undoAnonymousChanges()
+		table.clear(originalTextValues)
+
+		pcall(restoreCamera)
+		pcall(removeReverbs, 0.1)
+		pcall(blurSignature, false)
+
+		-- Put back everything Sirius changed globally
+		if setFpsCap then
+			pcall(setFpsCap, 240)
+		end
+		pcall(function()
+			gameSettings.MasterVolume = oldVolume
+		end)
+		pcall(function()
+			camera.FieldOfView = baseFieldOfView
+		end)
+
+		for _, coreUI in ipairs(env.cachedCoreUI or {}) do
+			pcall(starterGui.SetCoreGuiEnabled, starterGui, Enum.CoreGuiType[coreUI], true)
+		end
+
+		for _, cachedUI in ipairs(env.cachedInGameUI or {}) do
+			pcall(function()
+				if cachedUI.Parent then
+					cachedUI.Enabled = true
 				end
 			end)
 		end
+	end
 
-		toggle.Visible = not settingValue("Hide Toggle Button")
+	local lastAnonymousWanted = anonymousWanted()
+	local lastSpatialWanted = spatialShieldWanted()
 
-		-- Disconnected Check
-		-- These were hard indexes. RobloxPromptGui/promptOverlay aren't guaranteed to exist, and a
-		-- miss threw straight out of the loop.
-		local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
-		local promptOverlay = promptGui and promptGui:FindFirstChild("promptOverlay")
-		local disconnectedRobloxUI = promptOverlay and promptOverlay:FindFirstChild("ErrorPrompt")
-
-		if disconnectedRobloxUI and not promptedDisconnected then
-			local messageArea = disconnectedRobloxUI:FindFirstChild("MessageArea")
-			local errorFrame = messageArea and messageArea:FindFirstChild("ErrorFrame")
-			local errorMessage = errorFrame and errorFrame:FindFirstChild("ErrorMessage")
-			local reasonPrompt = errorMessage and errorMessage.Text or ""
-
-			promptedDisconnected = true
-			disconnectedPrompt.Parent = promptGui
-
-			local disconnectType
-			local foundString
-
-			for _, preDisconnectType in ipairs(siriusValues.disconnectTypes) do
-				for _, typeString in pairs(preDisconnectType[2]) do
-					if string.find(reasonPrompt, typeString) then
-						disconnectType = preDisconnectType[1]
-						foundString = true
-						break
-					end
-				end
-			end
-
-			if not foundString then
-				disconnectType = "kick"
-			end
-
-			wipeTransparency(disconnectedPrompt, 1, true)
-			disconnectedPrompt.Visible = true
-
-			if disconnectType == "ban" then
-				disconnectedPrompt.Content.Text = "You've been banned, would you like to leave this server?"
-				disconnectedPrompt.Action.Text = "Leave"
-				disconnectedPrompt.Action.Size = UDim2.new(0, 77, 0, 36) -- use textbounds
-
-				disconnectedPrompt.UIGradient.Color = ColorSequence.new({
-					ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
-					ColorSequenceKeypoint.new(1, Color3.new(0.819608, 0.164706, 0.164706)),
-				})
-			elseif disconnectType == "kick" then
-				disconnectedPrompt.Content.Text = "You've been kicked, would you like to serverhop?"
-				disconnectedPrompt.Action.Text = "Serverhop"
-				disconnectedPrompt.Action.Size = UDim2.new(0, 114, 0, 36)
-
-				disconnectedPrompt.UIGradient.Color = ColorSequence.new({
-					ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
-					ColorSequenceKeypoint.new(1, Color3.new(0.0862745, 0.596078, 0.835294)),
-				})
-			elseif disconnectType == "network" then
-				disconnectedPrompt.Content.Text = "You've lost connection, would you like to rejoin?"
-				disconnectedPrompt.Action.Text = "Rejoin"
-				disconnectedPrompt.Action.Size = UDim2.new(0, 82, 0, 36)
-
-				disconnectedPrompt.UIGradient.Color = ColorSequence.new({
-					ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
-					ColorSequenceKeypoint.new(1, Color3.new(0.862745, 0.501961, 0.0862745)),
-				})
-			end
-
-			tweenService:Create(disconnectedPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0 }):Play()
-			tweenService:Create(disconnectedPrompt.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
-			tweenService:Create(disconnectedPrompt.Content, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.3 }):Play()
-			tweenService:Create(disconnectedPrompt.Action, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.7 }):Play()
-			tweenService:Create(disconnectedPrompt.Action, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
-
-			disconnectedPrompt.Action.MouseButton1Click:Connect(function()
-				if disconnectType == "ban" then
-					leaveExperience()
-				elseif disconnectType == "kick" then
-					task.spawn(serverhop)
-				elseif disconnectType == "network" then
-					rejoin()
-				end
-			end)
+	while task.wait(1) do
+		if not checkSirius() then
+			teardown()
+			break
 		end
 
-		if Pro then
-			-- all Pro checks here!
+		-- A single throw in here used to end the loop permanently: no clock, no Home refresh, no
+		-- anti-idle, no latency or FPS warnings, and no disconnect detection for the rest of the
+		-- session - with the interface still on screen looking perfectly healthy.
+		local tickSuccess, tickError = pcall(function()
+			smartBar.Time.Text = os.date("%H") .. ":" .. os.date("%M")
+			task.spawn(UpdateHome)
 
-			-- Two-Way Adaptive Latency Checks
-			if checkHighPing() then
-				if siriusValues.pingProfile.pingNotificationCooldown <= 0 then
-					if settingValue("Adaptive Latency Warning") then
-						queueNotification(
-							"High Latency Warning",
-							"We've noticed your latency has reached a higher value than usual, you may find that you are lagging or your actions are delayed in-game. Consider checking for any background downloads on your machine.",
-							4370305588
-						)
-						siriusValues.pingProfile.pingNotificationCooldown = 120
+			-- Backfill tracking when either consumer is switched on mid-session
+			local anonymousNow, spatialNow = anonymousWanted(), spatialShieldWanted()
+			if (anonymousNow and not lastAnonymousWanted) or (spatialNow and not lastSpatialWanted) then
+				refreshDescendantTracking()
+			end
+			lastAnonymousWanted, lastSpatialWanted = anonymousNow, spatialNow
+
+			if getConnectionsFor then
+				local antiIdle = settingValue("Anti Idle")
+				pcall(function()
+					for _, connection in getConnectionsFor(localPlayer.Idled) do
+						if antiIdle then
+							connection:Disable()
+						else
+							connection:Enable()
+						end
 					end
-				end
+				end)
 			end
 
-			if siriusValues.pingProfile.pingNotificationCooldown > 0 then
-				siriusValues.pingProfile.pingNotificationCooldown -= 1
-			end
+			toggle.Visible = not settingValue("Hide Toggle Button")
 
-			-- Adaptive frame time checks
-			if siriusValues.frameProfile.frameNotificationCooldown <= 0 then
-				if #siriusValues.frameProfile.fpsQueue > 0 then
-					local avgFPS = siriusValues.frameProfile.totalFPS / #siriusValues.frameProfile.fpsQueue
+			-- Disconnected Check
+			-- These were hard indexes. RobloxPromptGui/promptOverlay aren't guaranteed to exist, and a
+			-- miss threw straight out of the loop.
+			local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
+			local promptOverlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+			local disconnectedRobloxUI = promptOverlay and promptOverlay:FindFirstChild("ErrorPrompt")
 
-					if avgFPS < siriusValues.frameProfile.lowFPSThreshold then
-						if settingValue("Adaptive Performance Warning") then
-							queueNotification(
-								"Degraded Performance",
-								"We've noticed your client's frames per second have decreased. Consider checking for any background tasks or programs on your machine.",
-								4384400106
-							)
-							siriusValues.frameProfile.frameNotificationCooldown = 120
+			if disconnectedRobloxUI and not promptedDisconnected then
+				local messageArea = disconnectedRobloxUI:FindFirstChild("MessageArea")
+				local errorFrame = messageArea and messageArea:FindFirstChild("ErrorFrame")
+				local errorMessage = errorFrame and errorFrame:FindFirstChild("ErrorMessage")
+				local reasonPrompt = errorMessage and errorMessage.Text or ""
+
+				promptedDisconnected = true
+				disconnectedPrompt.Parent = promptGui
+
+				local disconnectType
+				local foundString
+
+				for _, preDisconnectType in ipairs(siriusValues.disconnectTypes) do
+					for _, typeString in pairs(preDisconnectType[2]) do
+						if string.find(reasonPrompt, typeString) then
+							disconnectType = preDisconnectType[1]
+							foundString = true
+							break
 						end
 					end
 				end
+
+				if not foundString then
+					disconnectType = "kick"
+				end
+
+				wipeTransparency(disconnectedPrompt, 1, true)
+				disconnectedPrompt.Visible = true
+
+				if disconnectType == "ban" then
+					disconnectedPrompt.Content.Text = "You've been banned, would you like to leave this server?"
+					disconnectedPrompt.Action.Text = "Leave"
+					disconnectedPrompt.Action.Size = UDim2.new(0, 77, 0, 36) -- use textbounds
+
+					disconnectedPrompt.UIGradient.Color = ColorSequence.new({
+						ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
+						ColorSequenceKeypoint.new(1, Color3.new(0.819608, 0.164706, 0.164706)),
+					})
+				elseif disconnectType == "kick" then
+					disconnectedPrompt.Content.Text = "You've been kicked, would you like to serverhop?"
+					disconnectedPrompt.Action.Text = "Serverhop"
+					disconnectedPrompt.Action.Size = UDim2.new(0, 114, 0, 36)
+
+					disconnectedPrompt.UIGradient.Color = ColorSequence.new({
+						ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
+						ColorSequenceKeypoint.new(1, Color3.new(0.0862745, 0.596078, 0.835294)),
+					})
+				elseif disconnectType == "network" then
+					disconnectedPrompt.Content.Text = "You've lost connection, would you like to rejoin?"
+					disconnectedPrompt.Action.Text = "Rejoin"
+					disconnectedPrompt.Action.Size = UDim2.new(0, 82, 0, 36)
+
+					disconnectedPrompt.UIGradient.Color = ColorSequence.new({
+						ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
+						ColorSequenceKeypoint.new(1, Color3.new(0.862745, 0.501961, 0.0862745)),
+					})
+				end
+
+				tweenService:Create(disconnectedPrompt, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0 }):Play()
+				tweenService:Create(disconnectedPrompt.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
+				tweenService:Create(disconnectedPrompt.Content, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.3 }):Play()
+				tweenService:Create(disconnectedPrompt.Action, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.7 }):Play()
+				tweenService:Create(disconnectedPrompt.Action, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
+
+				disconnectedPrompt.Action.MouseButton1Click:Connect(function()
+					if disconnectType == "ban" then
+						leaveExperience()
+					elseif disconnectType == "kick" then
+						task.spawn(serverhop)
+					elseif disconnectType == "network" then
+						rejoin()
+					end
+				end)
 			end
 
-			if siriusValues.frameProfile.frameNotificationCooldown > 0 then
-				siriusValues.frameProfile.frameNotificationCooldown -= 1
+			if Pro then
+				-- all Pro checks here!
+
+				-- Two-Way Adaptive Latency Checks
+				if checkHighPing() then
+					if siriusValues.pingProfile.pingNotificationCooldown <= 0 then
+						if settingValue("Adaptive Latency Warning") then
+							queueNotification(
+								"High Latency Warning",
+								"We've noticed your latency has reached a higher value than usual, you may find that you are lagging or your actions are delayed in-game. Consider checking for any background downloads on your machine.",
+								4370305588
+							)
+							siriusValues.pingProfile.pingNotificationCooldown = 120
+						end
+					end
+				end
+
+				if siriusValues.pingProfile.pingNotificationCooldown > 0 then
+					siriusValues.pingProfile.pingNotificationCooldown -= 1
+				end
+
+				-- Adaptive frame time checks
+				if siriusValues.frameProfile.frameNotificationCooldown <= 0 then
+					if #siriusValues.frameProfile.fpsQueue > 0 then
+						local avgFPS = siriusValues.frameProfile.totalFPS / #siriusValues.frameProfile.fpsQueue
+
+						if avgFPS < siriusValues.frameProfile.lowFPSThreshold then
+							if settingValue("Adaptive Performance Warning") then
+								queueNotification(
+									"Degraded Performance",
+									"We've noticed your client's frames per second have decreased. Consider checking for any background tasks or programs on your machine.",
+									4384400106
+								)
+								siriusValues.frameProfile.frameNotificationCooldown = 120
+							end
+						end
+					end
+				end
+
+				if siriusValues.frameProfile.frameNotificationCooldown > 0 then
+					siriusValues.frameProfile.frameNotificationCooldown -= 1
+				end
 			end
+		end) -- end of the per-tick pcall
+
+		if not tickSuccess then
+			warn("Sirius | Error in the update loop (recovering): " .. tostring(tickError))
 		end
-	end) -- end of the per-tick pcall
-
-	if not tickSuccess then
-		warn("Sirius | Error in the update loop (recovering): " .. tostring(tickError))
 	end
 end
