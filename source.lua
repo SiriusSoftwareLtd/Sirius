@@ -4820,257 +4820,261 @@ track(runService.RenderStepped:Connect(function(frame)
 	end
 end))
 
--- The character's BasePart list is cached and maintained by events rather than rebuilt with
--- GetDescendants() on every physics step (~60x/sec, whether or not noclip was even on).
--- noclipDefaults was also keyed by part and never cleared, so it pinned a fresh set of dead part
--- references on every respawn.
-local characterParts = {}
-local characterPartConnections = {}
-
-local function clearCharacterPartTracking()
-	for _, connection in ipairs(characterPartConnections) do
-		connection:Disconnect()
-	end
-	table.clear(characterPartConnections)
-	table.clear(characterParts)
-	table.clear(noclipDefaults)
-end
-
-local function trackCharacterParts(character)
-	clearCharacterPartTracking()
-	if not character then
-		return
-	end
-
-	local function add(part)
-		if part:IsA("BasePart") then
-			characterParts[part] = true
-			if noclipDefaults[part] == nil then
-				noclipDefaults[part] = part.CanCollide
-			end
-		end
-	end
-
-	for _, descendant in ipairs(character:GetDescendants()) do
-		add(descendant)
-	end
-
-	table.insert(characterPartConnections, character.DescendantAdded:Connect(add))
-	table.insert(
-		characterPartConnections,
-		character.DescendantRemoving:Connect(function(part)
-			characterParts[part] = nil
-			noclipDefaults[part] = nil
-		end)
-	)
-end
-
-trackCharacterParts(localPlayer.Character)
-track(localPlayer.CharacterAdded:Connect(trackCharacterParts))
-track(localPlayer.CharacterRemoving:Connect(clearCharacterPartTracking))
-
-local noclipWasActive = false
-
-track(runService.Stepped:Connect(function()
-	if not checkSirius() then
-		return
-	end
-
-	local noclipActive = siriusValues.actions[1].enabled or siriusValues.actions[6].enabled
-
-	-- Only write CanCollide while noclip is on, plus once on the trailing edge to restore
-	if not noclipActive and not noclipWasActive then
-		return
-	end
-
-	for part in pairs(characterParts) do
-		if part.Parent then
-			if noclipActive then
-				part.CanCollide = false
-			else
-				local default = noclipDefaults[part]
-				part.CanCollide = if default == nil then true else default
-			end
-		end
-	end
-
-	noclipWasActive = noclipActive
-end))
-
-track(runService.Heartbeat:Connect(function()
-	if not checkSirius() then
-		return
-	end
-
-	local character = localPlayer.Character
-	local primaryPart = character and character.PrimaryPart
-	if primaryPart then
-		local bodyVelocity, bodyGyro = unpack(movers)
-
-		-- Drop cached movers if the old character was destroyed and took them with it.
-		-- Setting Parent on a destroyed instance throws, so probe before using.
-		if bodyVelocity then
-			local alive = pcall(function()
-				bodyVelocity.Parent = bodyVelocity.Parent
-			end)
-			if not alive then
-				movers = {}
-				bodyVelocity, bodyGyro = nil, nil
-			end
-		end
-
-		if not bodyVelocity then
-			bodyVelocity = Instance.new("BodyVelocity")
-			bodyVelocity.MaxForce = Vector3.one * 9e9
-
-			bodyGyro = Instance.new("BodyGyro")
-			bodyGyro.MaxTorque = Vector3.one * 9e9
-			bodyGyro.P = 9e4
-
-			local bodyAngularVelocity = Instance.new("BodyAngularVelocity")
-			bodyAngularVelocity.AngularVelocity = Vector3.yAxis * 9e9
-			bodyAngularVelocity.MaxTorque = Vector3.yAxis * 9e9
-			bodyAngularVelocity.P = 9e9
-
-			movers = { bodyVelocity, bodyGyro, bodyAngularVelocity }
-		end
-
-		-- Fly
-		if siriusValues.actions[2].enabled then
-			local camCFrame = camera.CFrame
-			local velocity = Vector3.zero
-			local rotation = camCFrame.Rotation
-
-			if userInputService:IsKeyDown(Enum.KeyCode.W) then
-				velocity += camCFrame.LookVector
-				rotation *= CFrame.Angles(math.rad(-40), 0, 0)
-			end
-			if userInputService:IsKeyDown(Enum.KeyCode.S) then
-				velocity -= camCFrame.LookVector
-				rotation *= CFrame.Angles(math.rad(40), 0, 0)
-			end
-			if userInputService:IsKeyDown(Enum.KeyCode.D) then
-				velocity += camCFrame.RightVector
-				rotation *= CFrame.Angles(0, 0, math.rad(-40))
-			end
-			if userInputService:IsKeyDown(Enum.KeyCode.A) then
-				velocity -= camCFrame.RightVector
-				rotation *= CFrame.Angles(0, 0, math.rad(40))
-			end
-			if userInputService:IsKeyDown(Enum.KeyCode.Space) then
-				velocity += Vector3.yAxis
-			end
-			if userInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-				velocity -= Vector3.yAxis
-			end
-
-			local tweenInfo = TweenInfo.new(0.5)
-			tweenService:Create(bodyVelocity, tweenInfo, { Velocity = velocity * siriusValues.sliders[3].value * 45 }):Play()
-			bodyVelocity.Parent = primaryPart
-
-			if not siriusValues.actions[6].enabled then
-				tweenService:Create(bodyGyro, tweenInfo, { CFrame = rotation }):Play()
-				bodyGyro.Parent = primaryPart
-			end
-		else
-			bodyVelocity.Parent = nil
-			bodyGyro.Parent = nil
-		end
-	end
-end))
-
--- Anonymous Client throttle/transition state
-local anonymousTickCounter = 0
-local anonymousWasEnabled = false
-local ANONYMOUS_TICK_INTERVAL = 15 -- run roughly 4x/sec instead of every frame
-
-track(runService.Heartbeat:Connect(function()
-	if not checkSirius() then
-		return
-	end
-	if Pro then
-		if settingValue("Spatial Shield") and tonumber(settingValue("Spatial Shield Threshold")) then
-			local threshold = tonumber(settingValue("Spatial Shield Threshold"))
-			-- iterate backwards so table.remove doesn't skip entries
-			for i = #soundInstances, 1, -1 do
-				local sound = soundInstances[i]
-				if not sound then
-					table.remove(soundInstances, i)
-				elseif gameSettings.MasterVolume * sound.PlaybackLoudness * sound.Volume >= threshold then
-					if sound.Volume > 0.55 then
-						suppressedSounds[sound.SoundId] = "S"
-						sound.Volume = 0.5
-					elseif sound.Volume > 0.2 and sound.Volume < 0.55 then
-						suppressedSounds[sound.SoundId] = "S2"
-						sound.Volume = 0.1
-					elseif sound.Volume < 0.2 then
-						suppressedSounds[sound.SoundId] = "Mute"
-						sound.Volume = 0
-					end
-					if soundSuppressionNotificationCooldown == 0 then
-						queueNotification("Spatial Shield", "A high-volume audio is being played (" .. sound.Name .. ") and it has been suppressed.", 4483362458)
-						soundSuppressionNotificationCooldown = 15
-					end
-					table.remove(soundInstances, i)
-				end
-			end
-		end
-
-		if soundSuppressionNotificationCooldown > 0 then
-			soundSuppressionNotificationCooldown -= 1
-		end
-	end
-
-	local anonymousEnabled = settingValue("Anonymous Client")
-
-	if anonymousEnabled then
-		-- Throttle: do the scan on every Nth heartbeat rather than every frame.
-		anonymousTickCounter += 1
-		if anonymousTickCounter >= ANONYMOUS_TICK_INTERVAL then
-			anonymousTickCounter = 0
-
-			for i = #cachedText, 1, -1 do
-				local text = cachedText[i]
-				if not text or not text.Parent then
-					-- Drop destroyed/orphaned labels so we stop scanning them.
-					trackedText[text] = nil
-					table.remove(cachedText, i)
-				elseif originalTextValues[text] == nil then
-					-- Only inspect labels we haven't already anonymized.
-					local raw = text.Text
-					local lowerText = string.lower(raw)
-					if string.find(lowerText, lowerName, 1, true) or string.find(lowerText, lowerDisplayName, 1, true) then
-						storeOriginalText(text)
-						-- Case-preserving and pattern-safe. The old version lowercased the whole
-						-- label, restored only the first character's case, and passed the raw
-						-- names to gsub as patterns - so a display name containing -, . or %
-						-- either mismatched or errored outright.
-						text.Text = replacePlain(replacePlain(raw, lowerName, randomUsername), lowerDisplayName, randomUsername)
-					end
-				end
-			end
-		end
-	elseif anonymousWasEnabled then
-		-- Only undo once on the off-transition, not every frame.
-		undoAnonymousChanges()
-		table.clear(originalTextValues)
-	end
-
-	anonymousWasEnabled = anonymousEnabled
-end))
-
--- Everything from here to the end of the file lives in its own block.
+-- Everything from here to the end of the file runs inside runtime().
 --
 -- Luau allows 200 locals per function scope and the main chunk is one of them. This file
--- had 201, so `lastSpatialWanted` -- the last one declared -- was rejected at compile time
+-- declared 207, so `lastSpatialWanted` -- one of the last -- was rejected at compile time
 -- with "Out of local registers". loadstring() then returned nil and the caller got
 -- "attempt to call a nil value" on line 1, with nothing to say why. Newer Luau reuses
--- registers from dead scopes and slipped under the limit; stricter executors did not, which
--- is the whole of "it works for some people". Nothing below is referenced above it, so
--- scoping it costs nothing and takes the chunk to 191.
+-- registers and slipped under the limit; stricter executors did not, which is the whole of
+-- "it works for some people".
 --
--- Adding a top-level local anywhere in this file spends part of that headroom.
-do
+-- It has to be a function, not a `do` block. A block shares the enclosing function's
+-- register file, so scoping this in `do ... end` moves nothing -- that was tried first and
+-- changed the count by zero. A function opens its own register file, which takes the chunk
+-- to 187 and gives this section a fresh 200 of its own.
+--
+-- Nothing below is referenced above it, and everything above stays reachable as an upvalue.
+local function runtime()
+	-- The character's BasePart list is cached and maintained by events rather than rebuilt with
+	-- GetDescendants() on every physics step (~60x/sec, whether or not noclip was even on).
+	-- noclipDefaults was also keyed by part and never cleared, so it pinned a fresh set of dead part
+	-- references on every respawn.
+	local characterParts = {}
+	local characterPartConnections = {}
+
+	local function clearCharacterPartTracking()
+		for _, connection in ipairs(characterPartConnections) do
+			connection:Disconnect()
+		end
+		table.clear(characterPartConnections)
+		table.clear(characterParts)
+		table.clear(noclipDefaults)
+	end
+
+	local function trackCharacterParts(character)
+		clearCharacterPartTracking()
+		if not character then
+			return
+		end
+
+		local function add(part)
+			if part:IsA("BasePart") then
+				characterParts[part] = true
+				if noclipDefaults[part] == nil then
+					noclipDefaults[part] = part.CanCollide
+				end
+			end
+		end
+
+		for _, descendant in ipairs(character:GetDescendants()) do
+			add(descendant)
+		end
+
+		table.insert(characterPartConnections, character.DescendantAdded:Connect(add))
+		table.insert(
+			characterPartConnections,
+			character.DescendantRemoving:Connect(function(part)
+				characterParts[part] = nil
+				noclipDefaults[part] = nil
+			end)
+		)
+	end
+
+	trackCharacterParts(localPlayer.Character)
+	track(localPlayer.CharacterAdded:Connect(trackCharacterParts))
+	track(localPlayer.CharacterRemoving:Connect(clearCharacterPartTracking))
+
+	local noclipWasActive = false
+
+	track(runService.Stepped:Connect(function()
+		if not checkSirius() then
+			return
+		end
+
+		local noclipActive = siriusValues.actions[1].enabled or siriusValues.actions[6].enabled
+
+		-- Only write CanCollide while noclip is on, plus once on the trailing edge to restore
+		if not noclipActive and not noclipWasActive then
+			return
+		end
+
+		for part in pairs(characterParts) do
+			if part.Parent then
+				if noclipActive then
+					part.CanCollide = false
+				else
+					local default = noclipDefaults[part]
+					part.CanCollide = if default == nil then true else default
+				end
+			end
+		end
+
+		noclipWasActive = noclipActive
+	end))
+
+	track(runService.Heartbeat:Connect(function()
+		if not checkSirius() then
+			return
+		end
+
+		local character = localPlayer.Character
+		local primaryPart = character and character.PrimaryPart
+		if primaryPart then
+			local bodyVelocity, bodyGyro = unpack(movers)
+
+			-- Drop cached movers if the old character was destroyed and took them with it.
+			-- Setting Parent on a destroyed instance throws, so probe before using.
+			if bodyVelocity then
+				local alive = pcall(function()
+					bodyVelocity.Parent = bodyVelocity.Parent
+				end)
+				if not alive then
+					movers = {}
+					bodyVelocity, bodyGyro = nil, nil
+				end
+			end
+
+			if not bodyVelocity then
+				bodyVelocity = Instance.new("BodyVelocity")
+				bodyVelocity.MaxForce = Vector3.one * 9e9
+
+				bodyGyro = Instance.new("BodyGyro")
+				bodyGyro.MaxTorque = Vector3.one * 9e9
+				bodyGyro.P = 9e4
+
+				local bodyAngularVelocity = Instance.new("BodyAngularVelocity")
+				bodyAngularVelocity.AngularVelocity = Vector3.yAxis * 9e9
+				bodyAngularVelocity.MaxTorque = Vector3.yAxis * 9e9
+				bodyAngularVelocity.P = 9e9
+
+				movers = { bodyVelocity, bodyGyro, bodyAngularVelocity }
+			end
+
+			-- Fly
+			if siriusValues.actions[2].enabled then
+				local camCFrame = camera.CFrame
+				local velocity = Vector3.zero
+				local rotation = camCFrame.Rotation
+
+				if userInputService:IsKeyDown(Enum.KeyCode.W) then
+					velocity += camCFrame.LookVector
+					rotation *= CFrame.Angles(math.rad(-40), 0, 0)
+				end
+				if userInputService:IsKeyDown(Enum.KeyCode.S) then
+					velocity -= camCFrame.LookVector
+					rotation *= CFrame.Angles(math.rad(40), 0, 0)
+				end
+				if userInputService:IsKeyDown(Enum.KeyCode.D) then
+					velocity += camCFrame.RightVector
+					rotation *= CFrame.Angles(0, 0, math.rad(-40))
+				end
+				if userInputService:IsKeyDown(Enum.KeyCode.A) then
+					velocity -= camCFrame.RightVector
+					rotation *= CFrame.Angles(0, 0, math.rad(40))
+				end
+				if userInputService:IsKeyDown(Enum.KeyCode.Space) then
+					velocity += Vector3.yAxis
+				end
+				if userInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+					velocity -= Vector3.yAxis
+				end
+
+				local tweenInfo = TweenInfo.new(0.5)
+				tweenService:Create(bodyVelocity, tweenInfo, { Velocity = velocity * siriusValues.sliders[3].value * 45 }):Play()
+				bodyVelocity.Parent = primaryPart
+
+				if not siriusValues.actions[6].enabled then
+					tweenService:Create(bodyGyro, tweenInfo, { CFrame = rotation }):Play()
+					bodyGyro.Parent = primaryPart
+				end
+			else
+				bodyVelocity.Parent = nil
+				bodyGyro.Parent = nil
+			end
+		end
+	end))
+
+	-- Anonymous Client throttle/transition state
+	local anonymousTickCounter = 0
+	local anonymousWasEnabled = false
+	local ANONYMOUS_TICK_INTERVAL = 15 -- run roughly 4x/sec instead of every frame
+
+	track(runService.Heartbeat:Connect(function()
+		if not checkSirius() then
+			return
+		end
+		if Pro then
+			if settingValue("Spatial Shield") and tonumber(settingValue("Spatial Shield Threshold")) then
+				local threshold = tonumber(settingValue("Spatial Shield Threshold"))
+				-- iterate backwards so table.remove doesn't skip entries
+				for i = #soundInstances, 1, -1 do
+					local sound = soundInstances[i]
+					if not sound then
+						table.remove(soundInstances, i)
+					elseif gameSettings.MasterVolume * sound.PlaybackLoudness * sound.Volume >= threshold then
+						if sound.Volume > 0.55 then
+							suppressedSounds[sound.SoundId] = "S"
+							sound.Volume = 0.5
+						elseif sound.Volume > 0.2 and sound.Volume < 0.55 then
+							suppressedSounds[sound.SoundId] = "S2"
+							sound.Volume = 0.1
+						elseif sound.Volume < 0.2 then
+							suppressedSounds[sound.SoundId] = "Mute"
+							sound.Volume = 0
+						end
+						if soundSuppressionNotificationCooldown == 0 then
+							queueNotification("Spatial Shield", "A high-volume audio is being played (" .. sound.Name .. ") and it has been suppressed.", 4483362458)
+							soundSuppressionNotificationCooldown = 15
+						end
+						table.remove(soundInstances, i)
+					end
+				end
+			end
+
+			if soundSuppressionNotificationCooldown > 0 then
+				soundSuppressionNotificationCooldown -= 1
+			end
+		end
+
+		local anonymousEnabled = settingValue("Anonymous Client")
+
+		if anonymousEnabled then
+			-- Throttle: do the scan on every Nth heartbeat rather than every frame.
+			anonymousTickCounter += 1
+			if anonymousTickCounter >= ANONYMOUS_TICK_INTERVAL then
+				anonymousTickCounter = 0
+
+				for i = #cachedText, 1, -1 do
+					local text = cachedText[i]
+					if not text or not text.Parent then
+						-- Drop destroyed/orphaned labels so we stop scanning them.
+						trackedText[text] = nil
+						table.remove(cachedText, i)
+					elseif originalTextValues[text] == nil then
+						-- Only inspect labels we haven't already anonymized.
+						local raw = text.Text
+						local lowerText = string.lower(raw)
+						if string.find(lowerText, lowerName, 1, true) or string.find(lowerText, lowerDisplayName, 1, true) then
+							storeOriginalText(text)
+							-- Case-preserving and pattern-safe. The old version lowercased the whole
+							-- label, restored only the first character's case, and passed the raw
+							-- names to gsub as patterns - so a display name containing -, . or %
+							-- either mismatched or errored outright.
+							text.Text = replacePlain(replacePlain(raw, lowerName, randomUsername), lowerDisplayName, randomUsername)
+						end
+					end
+				end
+			end
+		elseif anonymousWasEnabled then
+			-- Only undo once on the off-transition, not every frame.
+			undoAnonymousChanges()
+			table.clear(originalTextValues)
+		end
+
+		anonymousWasEnabled = anonymousEnabled
+	end))
+
 	-- Descendant tracking.
 	--
 	-- Two things changed here. Membership is now a hash-set lookup instead of table.find, which was
@@ -5402,3 +5406,5 @@ do
 		end
 	end
 end
+
+runtime()
