@@ -269,6 +269,8 @@ local siriusValues = {
 		"trigon",
 		"vegax",
 		"cryptic",
+		"world",
+		"worldinternal",
 	},
 	disconnectTypes = { { "ban", { "ban", "perm" } }, { "network", { "internet connection", "network" } } },
 	nameGeneration = {
