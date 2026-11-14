@@ -2616,7 +2616,7 @@ local function openScriptSearch()
 	scriptSearch.Icon.Position = UDim2.new(0.04, 0, 0.5, 0)
 	scriptSearch.SearchBox.Text = ""
 	scriptSearch.UIGradient.Offset = Vector2.new(0, 2)
-	scriptSearch.SearchBox.PlaceholderText = "Search ScriptBlox.com"
+	scriptSearch.SearchBox.PlaceholderText = "Search RoScripts"
 	scriptSearch.List.Template.Visible = false
 	scriptSearch.List.Visible = false
 	scriptSearch.Visible = true
@@ -2678,72 +2678,96 @@ local function createScript(result)
 		end
 	end
 
-	task.spawn(function()
-		local response
-
-		local success = pcall(function()
-			local responseRequest = httpRequest({
-				Url = "https://www.scriptblox.com/api/script/" .. result["slug"],
-				Method = "GET",
-			})
-
-			response = httpService:JSONDecode(responseRequest.Body)
-		end)
-
-		if not success or not response or not response.script then
-			return
-		end
-
-		newScript.ScriptDescription.Text = response.script.features
-
-		local likes = response.script.likeCount
-		local dislikes = response.script.dislikeCount
-
-		if likes ~= dislikes then
-			newScript.Tags.Review.Title.Text = (likes > dislikes) and "Positive Reviews" or "Negative Reviews"
-			newScript.Tags.Review.BackgroundColor3 = (likes > dislikes) and Color3.fromRGB(0, 139, 102) or Color3.fromRGB(180, 0, 0)
-			newScript.Tags.Review.Size = (likes > dislikes) and UDim2.new(0, 145, 1, 0) or UDim2.new(0, 150, 1, 0)
-		elseif likes > 0 then
-			newScript.Tags.Review.Title.Text = "Mixed Reviews"
-			newScript.Tags.Review.BackgroundColor3 = Color3.fromRGB(198, 132, 0)
-			newScript.Tags.Review.Size = UDim2.new(0, 130, 1, 0)
-		else
-			newScript.Tags.Review.Visible = false
-		end
-
-		newScript.ScriptAuthor.Text = "uploaded by " .. response.script.owner.username
-		newScript.Tags.Verified.Visible = response.script.owner.verified or false
-
-		tweenService:Create(newScript, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.8 }):Play()
-		tweenService:Create(newScript.ScriptName, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
-		tweenService:Create(newScript.Execute, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.8 }):Play()
-		tweenService:Create(newScript.Execute, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
-
-		newScript.Tags.Visible = true
-
-		tweenService:Create(newScript.ScriptDescription, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.3 }):Play()
-		tweenService:Create(newScript.ScriptAuthor, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.7 }):Play()
-
-		for _, tag in ipairs(newScript.Tags:GetChildren()) do
-			if tag.ClassName == "Frame" then
-				tweenService:Create(tag.Shadow, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { ImageTransparency = 0.7 }):Play()
-				tweenService:Create(tag, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0 }):Play()
-				tweenService:Create(tag.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
-			end
-		end
-	end)
-
 	wipeTransparency(newScript, 1, true)
 
 	newScript.ScriptName.Text = result.title
+	newScript.ScriptDescription.Text = type(result.description) == "string" and result.description or ""
 
-	newScript.Tags.Visible = false
-	newScript.Tags.Patched.Visible = result.isPatched or false
+	-- Each search result already carries its description, votes and uploader, so nothing is
+	-- fetched per row
+	local likes = tonumber(result.likeCount) or 0
+	local dislikes = tonumber(result.dislikeCount) or 0
+
+	if likes ~= dislikes then
+		newScript.Tags.Review.Title.Text = (likes > dislikes) and "Positive Reviews" or "Negative Reviews"
+		newScript.Tags.Review.BackgroundColor3 = (likes > dislikes) and Color3.fromRGB(0, 139, 102) or Color3.fromRGB(180, 0, 0)
+		newScript.Tags.Review.Size = (likes > dislikes) and UDim2.new(0, 145, 1, 0) or UDim2.new(0, 150, 1, 0)
+	elseif likes > 0 then
+		newScript.Tags.Review.Title.Text = "Mixed Reviews"
+		newScript.Tags.Review.BackgroundColor3 = Color3.fromRGB(198, 132, 0)
+		newScript.Tags.Review.Size = UDim2.new(0, 130, 1, 0)
+	else
+		newScript.Tags.Review.Visible = false
+	end
+
+	-- owner can be null
+	local owner = type(result.owner) == "table" and result.owner or nil
+	newScript.ScriptAuthor.Text = (owner and type(owner.username) == "string") and "uploaded by " .. owner.username or ""
+	newScript.Tags.Verified.Visible = result.verified == true
+	newScript.Tags.Patched.Visible = result.patched == true
+
+	tweenService:Create(newScript, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.8 }):Play()
+	tweenService:Create(newScript.ScriptName, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
+	tweenService:Create(newScript.Execute, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0.8 }):Play()
+	tweenService:Create(newScript.Execute, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
+
+	newScript.Tags.Visible = true
+
+	tweenService:Create(newScript.ScriptDescription, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.3 }):Play()
+	tweenService:Create(newScript.ScriptAuthor, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0.7 }):Play()
+
+	for _, tag in ipairs(newScript.Tags:GetChildren()) do
+		if tag.ClassName == "Frame" then
+			tweenService:Create(tag.Shadow, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { ImageTransparency = 0.7 }):Play()
+			tweenService:Create(tag, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { BackgroundTransparency = 0 }):Play()
+			tweenService:Create(tag.Title, TweenInfo.new(0.5, Enum.EasingStyle.Quint), { TextTransparency = 0 }):Play()
+		end
+	end
+
+	local fetching = false
 
 	newScript.Execute.MouseButton1Click:Connect(function()
-		-- The search endpoint doesn't always include a script body; loadstring(nil) threw here
-		if type(result.script) ~= "string" or #result.script == 0 then
-			queueNotification("ScriptSearch", "ScriptBlox didn't return a script body for " .. result.title .. ".", 4384402990)
+		if fetching then
+			return
+		end
+		fetching = true
+
+		-- The loadstring link serves the script's code for every result, key systems included.
+		-- It answers 404 with a Lua comment for a script that is held or was taken down, and
+		-- that is never run.
+		local source
+		local unavailable = false
+
+		if type(result.loadstring) == "string" and #result.loadstring > 0 then
+			local fetchSuccess, response = pcall(httpRequest, {
+				Url = result.loadstring,
+				Method = "GET",
+			})
+
+			if fetchSuccess and type(response) == "table" then
+				local statusCode = tonumber(response.StatusCode)
+				if statusCode and statusCode ~= 200 then
+					unavailable = true
+				elseif response.Success ~= false and type(response.Body) == "string" and #response.Body > 0 then
+					source = response.Body
+				end
+			end
+		end
+
+		fetching = false
+
+		-- Closing ScriptSearch while the code was loading destroys the row; don't run it then
+		if not newScript.Parent then
+			return
+		end
+
+		if unavailable then
+			queueNotification("ScriptSearch", result.title .. " isn't available on RoScripts right now.", 4384402990)
+			return
+		end
+
+		if not source then
+			queueNotification("ScriptSearch", "RoScripts didn't return a script body for " .. result.title .. ".", 4384402990)
 			return
 		end
 
@@ -2752,7 +2776,7 @@ local function createScript(result)
 
 		-- A third-party script that fails to compile or errors on load shouldn't surface as an
 		-- unexplained Sirius error
-		local chunk, compileError = loadstring(result.script)
+		local chunk, compileError = loadstring(source)
 		if not chunk then
 			queueNotification("ScriptSearch", "Couldn't run " .. result.title .. ": " .. tostring(compileError), 4384402990)
 			return
@@ -2993,8 +3017,9 @@ if originalSetClipboard then
 	end
 end
 
-local function searchScriptBlox(query)
+local function searchRoScripts(query)
 	local response
+	local statusCode
 
 	if not httpRequest then
 		queueNotification("ScriptSearch", "ScriptSearch needs an executor with a request function, and this one doesn't expose it.", 4384402990)
@@ -3003,13 +3028,24 @@ local function searchScriptBlox(query)
 	end
 
 	local success = pcall(function()
+		-- The API refuses a query over 120 characters. mode=free leaves out paid scripts, and
+		-- client=sirius only names the caller in RoScripts' API logs.
 		local responseRequest = httpRequest({
-			Url = "https://scriptblox.com/api/script/search?q=" .. httpService:UrlEncode(query) .. "&mode=free&max=20&page=1",
+			Url = "https://api.roscripts.io/v1/scripts/search?q=" .. httpService:UrlEncode(string.sub(query, 1, 120)) .. "&mode=free&max=20&client=sirius",
 			Method = "GET",
 		})
 
+		statusCode = tonumber(responseRequest.StatusCode)
 		response = httpService:JSONDecode(responseRequest.Body)
 	end)
+
+	-- Anonymous callers get 30 searches a minute per address
+	local rateLimited = statusCode == 429 or (type(response) == "table" and type(response.error) == "table" and response.error.code == "rate_limited")
+	if rateLimited then
+		queueNotification("ScriptSearch", "ScriptSearch is getting too many requests, try again in a minute", 4384402990)
+		closeScriptSearch()
+		return
+	end
 
 	-- The old code checked `success` here but then indexed response.result.scripts further down
 	-- without ever checking that the shape was what it expected
@@ -3046,9 +3082,12 @@ local function searchScriptBlox(query)
 
 	local scriptCreated = false
 	for _, scriptResult in ipairs(response.result.scripts) do
+		-- Free scripts only, even if the API ever ignores mode=free
+		local paid = type(scriptResult) ~= "table" or scriptResult.scriptType == "paid" or scriptResult.marketplaceUrl ~= nil
+
 		-- scriptCreated used to be set even when createScript threw, so a page of failures
 		-- still reported as results
-		if pcall(createScript, scriptResult) then
+		if not paid and pcall(createScript, scriptResult) then
 			scriptCreated = true
 		end
 	end
@@ -4683,8 +4722,8 @@ scriptSearch.SearchBox.FocusLost:Connect(function(enterPressed)
 
 	if #scriptSearch.SearchBox.Text > 0 then
 		if enterPressed then
-			-- searchScriptBlox reports its own failures through queueNotification
-			pcall(searchScriptBlox, scriptSearch.SearchBox.Text)
+			-- searchRoScripts reports its own failures through queueNotification
+			pcall(searchRoScripts, scriptSearch.SearchBox.Text)
 		end
 	else
 		closeScriptSearch()
